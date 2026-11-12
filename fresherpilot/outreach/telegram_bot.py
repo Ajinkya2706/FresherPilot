@@ -27,7 +27,7 @@ from fresherpilot.core import users
 
 API = "https://api.telegram.org/bot{token}/{method}"
 MAX_ALERTS_PER_BATCH = 6     # more new jobs at once (e.g. after a pause): the rest go in one summary
-OLD_DAYS = 3                 # jobs posted longer ago than this are counted in the summary, not alerted
+OLD_DAYS = 1                 # alerts are for fresh jobs: posted more than a day ago = counted in the summary, not alerted (was 3)
 _lock = threading.Lock()
 _codes: dict[str, tuple[str, float]] = {}  # connect code -> (uid, expires)
 _names: dict[str, str] = {}                # token -> bot username
@@ -194,6 +194,8 @@ def _job_text(job: dict[str, Any], v: dict[str, Any]) -> str:
     mode = apply_mode(job)
     if mode:
         lines.append({"easy": "📱 Easy Apply", "site": "💻 Company site"}[mode])
+    if isinstance(years, (int, float)) and years >= 1 and v.get("freshers_welcome"):
+        lines.append(f"🎯 Lists {years:g}+ yrs, but the post says skilled freshers are welcome: worth a try")
     why = v.get("fit_reason") or v.get("reason")
     if why:
         lines.append(f"✅ {_e(why)[:300]}")

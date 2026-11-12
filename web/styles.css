@@ -505,3 +505,18 @@ details.datatable th:first-child, details.datatable td:first-child { text-align:
 .fetch-card .fc-step.done { border-color: var(--accent); color: var(--text); }
 .fetch-card .fc-step.busy { border-color: var(--line-strong); color: var(--text); font-weight: 600; }
 .fetch-card .fc-step.err { border-color: #d97706; }
+
+/* Pipeline strip: three independent stages, each with its own queue (compact: one line each) */
+.pipeline { display: flex; align-items: center; gap: 6px; margin: 8px 20px !important; }
+.pipeline .stage { flex: 1 1 0; min-width: 0; display: grid; grid-template-columns: auto 1fr; column-gap: 10px; align-items: center;
+  padding: 7px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.pipeline .stage h3 { grid-column: 1 / -1; margin: 0; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: none; letter-spacing: .02em; }
+.pipeline .stage .big { margin: 0; font-size: 16px; font-weight: 700; color: var(--text); white-space: nowrap; }
+.pipeline .stage .sub { margin: 0; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pipeline .stage .btn { display: none; }
+.pipeline #stApply .btn { display: inline-flex; grid-column: 1 / -1; margin-top: 4px; padding: 2px 8px; font-size: 11px; justify-self: start; }
+.pipeline .stage.busy { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft) inset; }
+.pipeline .stage.warn { border-color: var(--warn); background: var(--warn-soft); }
+.pipeline .stage.warn .big, .pipeline .stage.warn .sub { color: var(--warn); }
+.pipeline .arrow { color: var(--muted); font-size: 14px; }
+@media (max-width: 720px) { .pipeline { flex-direction: column; align-items: stretch; } .pipeline .stage { width: 100%; } .pipeline .arrow { transform: rotate(90deg); align-self: center; } }

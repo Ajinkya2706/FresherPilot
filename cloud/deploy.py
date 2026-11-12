@@ -56,6 +56,8 @@ def build_config() -> dict:
         "places": live_poller._places(),
         "reject_from_years": float(p.get("reject_from_years", 1)),
         "stretch_jobs": bool(p.get("stretch_jobs")),
+        "skilled_freshers": p.get("skilled_freshers", True) is not False,
+        "blocked_companies": [str(x) for x in (p.get("blocked_companies") or []) if str(x).strip()],
         "title_exclude": cfg.TITLE_EXCLUDE,
         "title_exclude_soft": cfg.TITLE_EXCLUDE_SOFT,
         "title_soft_skip": cfg.TITLE_SOFT_SKIP,
@@ -96,6 +98,7 @@ def build_config() -> dict:
         "city_words": sorted({w for c in apify_jobs._locations()[0] for w in cfg.CITY_ALIASES.get(c.lower(), [c.lower()])}),
         "remote_ok": apify_jobs._locations()[1],
         "remote_regex": apify_jobs._REMOTE.pattern,
+        "foreign_regex": apify_jobs._FOREIGN.pattern,
         "nationwide_regex": apify_jobs._NATIONWIDE.pattern,
         "posted_within_days": cfg.POSTED_WITHIN_DAYS,
     }

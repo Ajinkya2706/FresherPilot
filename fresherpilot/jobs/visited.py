@@ -32,8 +32,16 @@ def uid(job: dict[str, Any]) -> str:
     return f"{job.get('source')}:{job.get('id')}"
 
 
+@functools.lru_cache(maxsize=262144)
+def _norm_short(t: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+
+
 def _norm(s: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+    # Titles / companies repeat thousands of times in one list build (78k calls for 12k jobs = 5 s): cached.
+    # Long texts (descriptions) are not kept in this cache.
+    t = str(s or "")
+    return _norm_short(t) if len(t) <= 200 else re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
 
 
 def _alt(job: dict[str, Any]) -> str:
@@ -69,7 +77,7 @@ def _title_core(title: Any) -> str:
     return " ".join(sorted(words))
 
 
-@functools.lru_cache(maxsize=32768)
+@functools.lru_cache(maxsize=131072)
 def _loose_keys(title: str, company: str, description: str) -> tuple[str, ...]:
     keys = []
     core = _company_core(company)

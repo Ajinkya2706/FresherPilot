@@ -32,11 +32,14 @@ def _log_path() -> Path:
 STATE: dict[str, Any] = {
     "running": False, "mode": None, "queue": [], "total": 0, "index": 0,
     "applied": 0, "skipped": 0, "failed": 0, "current": None, "waiting": None,
-    "log": [], "command": None,
+    "log": [], "command": None, "commands": [],  # commands = clicks on the page waiting to be read (one slot lost clicks)
     # Jobs set aside because they need you (sign in, CAPTCHA, a question, a form to submit): the run goes on with
     # the next job and comes back to these when you've done it or press Continue on one. uid -> info / command.
     "parked": {}, "job_commands": {}, "final": [], "paused": False, "current_at": None,
     "run_id": None, "ext_seen": 0.0, "titles": {},
+    # The run the extension has not picked up yet. The extension pulls it itself (alarm every ~30 s), so a run can be
+    # started without an app page open (CLI / assistant / API), like a consumer reading a queue.
+    "pending": None, "started_at": 0.0,
 }
 _lock = threading.Lock()
 
@@ -195,8 +198,8 @@ def emailed_only() -> set[str]:
     return mailed - site
 
 
-def eligible_jobs(include_with_instructions: bool = False) -> list[dict[str, Any]]:
-    """AI-approved jobs not applied yet, newest first."""
+def eligible_jobs(include_with_instructions: bool = False, force: set[str] | None = None) -> list[dict[str, Any]]:
+    """AI-approved jobs not applied yet, newest first. force = uids the user asked for by link: no AI verdict needed."""
     from fresherpilot.apply import applicant
     from fresherpilot.outreach import contacts
     from fresherpilot.jobs import llm_filter
@@ -214,13 +217,18 @@ def eligible_jobs(include_with_instructions: bool = False) -> list[dict[str, Any
             continue
         uid = f"{job.get('source')}:{job.get('id')}"
         verdict = llm_filter.cached_verdict(job) or {}
-        if verdict.get("decision") != "keep" or (uid in apps and uid not in email_only):
+        if (verdict.get("decision") != "keep" and uid not in (force or ())) or (uid in apps and uid not in email_only):
             continue
         if verdict.get("apply_instructions") and not include_with_instructions:
             continue
         job["uid"] = uid
         job["employer"] = contacts.resolve_company(job)
         if blocked and (_company(job).lower() in blocked or str(job.get("company") or "").strip().lower() in blocked):
+            continue
+        if llm_filter.blocked_company(job.get("company", "")):  # the Settings blocklist
+            continue
+        from fresherpilot.jobs.apify_jobs import in_wanted_location
+        if not in_wanted_location(job):  # e.g. "United States, Remote": can't be applied to from India
             continue
         if uid in never_keys or (never_keys and any(k in never_keys for k in _jd_keys(job))):
             continue
@@ -391,13 +399,13 @@ def preview() -> dict[str, Any]:
 
 
 def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None = None,
-          pick: list[str] | None = None, hours: float | None = None) -> dict[str, Any]:
+          pick: list[str] | None = None, hours: float | None = None, force: list[str] | None = None) -> dict[str, Any]:
     with _lock:
         if STATE["running"]:
             raise RuntimeError("Auto-apply is already running")
     single = bool(uids)
     done_email = emailed_only()
-    jobs = eligible_jobs(include_with_instructions=True)
+    jobs = eligible_jobs(include_with_instructions=True, force=set(force or ()))
     if pick and not uids:  # the jobs ticked on the Auto-apply page (bulk run, Easy Apply first as usual)
         chosen = set(pick)
         jobs = [j for j in jobs if j["uid"] in chosen]
@@ -448,7 +456,7 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
         queue.append(item)
     with _lock:
         STATE.update(running=True, mode="single" if single else "bulk", queue=queue, total=len(queue), index=0,
-                     applied=0, skipped=0, failed=0, current=None, waiting=None, command=None, parked={}, job_commands={},
+                     applied=0, skipped=0, failed=0, current=None, waiting=None, command=None, commands=[], parked={}, job_commands={},
                      final=[], paused=False, current_at=None, run_id=uuid.uuid4().hex[:12], ext_seen=time.time())
         STATE["titles"].update({q["uid"]: {"title": q.get("title"), "company": q.get("company")} for q in queue})
     _log("start", None, f"{len(queue)} job(s) queued ({'this job' if single else 'Easy Apply first, then newest'}): "
@@ -461,7 +469,10 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
         users.thread(_send_application_emails, emails, False)  # the browser queue always has these jobs too  # runs as this user (keys, Gmail, profile)
     elif not browser:
         report("finished", None)
-    return {"queue": browser, "settings": SETTINGS, "mode": STATE["mode"], "run_id": STATE["run_id"]}
+    payload = {"queue": browser, "settings": SETTINGS, "mode": STATE["mode"], "run_id": STATE["run_id"]}
+    with _lock:
+        STATE["pending"], STATE["started_at"] = payload, time.time()
+    return payload
 
 
 def _log(event: str, job: dict[str, Any] | None, detail: str = "", uid: str | None = None) -> None:
@@ -486,6 +497,8 @@ def report(event: str, uid: str | None, detail: str = "", waiting: dict[str, Any
         with _lock:
             STATE["ext_seen"] = time.time()
             stale = run != STATE.get("run_id")
+            if not stale:
+                STATE["pending"] = None  # the extension has it (handed over by the page or pulled)
         if stale:
             return {"stale": True}
     job = next((q for q in STATE["queue"] if q["uid"] == uid), None) if uid else None
@@ -516,7 +529,7 @@ def report(event: str, uid: str | None, detail: str = "", waiting: dict[str, Any
                                     "at": datetime.now(timezone.utc).isoformat()}
             STATE["waiting"] = None
         elif event == "finished":
-            STATE.update(running=False, current=None, waiting=None, command=None, paused=False, current_at=None)
+            STATE.update(running=False, current=None, waiting=None, command=None, commands=[], paused=False, current_at=None, pending=None)
         if event in ("applied", "skipped", "failed") and uid:
             STATE["parked"].pop(uid, None)
             STATE["job_commands"].pop(uid, None)
@@ -557,12 +570,18 @@ def command(action: str, uid: str | None = None) -> None:
             STATE["job_commands"][uid] = action
         return
     with _lock:
-        STATE["command"] = action
+        STATE["commands"] = [c for c in STATE["commands"] if c != action]  # a click twice = once
+        if action == "stop":
+            STATE["commands"] = []  # nothing else matters any more
+        STATE["commands"].append(action)
     if action in ("applied", "skip") and cur and STATE.get("mode") != "single":
         report("applied" if action == "applied" else "skipped", cur, "applied by you" if action == "applied" else "skipped by you")
 
 
-def take_command(uid: str | None = None, run: str | None = None) -> str | None:
+def take_command(uid: str | None = None, run: str | None = None, accept: list[str] | None = None) -> str | None:
+    """Next click for one reader. accept = the commands this reader handles: the others stay for their own reader
+    (before, the Continue click of one poller could be eaten by another that ignored it, and a second click
+    overwrote the first)."""
     with _lock:
         if run:
             if run != STATE.get("run_id"):
@@ -570,16 +589,52 @@ def take_command(uid: str | None = None, run: str | None = None) -> str | None:
             STATE["ext_seen"] = time.time()
         if uid:
             return STATE["job_commands"].pop(uid, None)
-        cmd, STATE["command"] = STATE["command"], None
-        return cmd
+        for i, c in enumerate(STATE["commands"]):
+            if accept is None or c in accept:
+                return STATE["commands"].pop(i)
+        return None
+
+
+def take_pending() -> dict[str, Any] | None:
+    """The extension asks for work. A started run nobody picked up yet is handed over once."""
+    with _lock:
+        p = STATE.get("pending")
+        if not (STATE["running"] and p):
+            return None
+        STATE["pending"] = None
+        STATE["ext_seen"] = time.time()
+        return p
+
+
+NOBODY_PICKED_UP_S = 150   # a run no browser picked up: Chrome closed / extension missing -> end it, don't hang
+GONE_SILENT_S = 600        # the extension stopped checking in during a run (it polls every 2 s) -> end it
+
+
+def watchdog() -> None:
+    """Ends runs that can never finish by themselves (they showed "running" forever before: Nov 6 2026)."""
+    now = time.time()
+    with _lock:
+        if not STATE["running"]:
+            return
+        never = STATE.get("pending") is not None and now - (STATE.get("started_at") or now) > NOBODY_PICKED_UP_S
+        silent = STATE.get("pending") is None and STATE.get("ext_seen") and now - STATE["ext_seen"] > GONE_SILENT_S             and not STATE["paused"]
+    if never:
+        STATE["pending"] = None
+        _log("finished", None, f"no browser picked this run up within {NOBODY_PICKED_UP_S} s: open Chrome with the FresherPilot extension, then Start again")
+        report("finished", None)
+    elif silent:
+        _log("finished", None, "the extension stopped answering: run ended (press Start to run again)")
+        report("finished", None)
 
 
 def status() -> dict[str, Any]:
+    watchdog()
     with _lock:
         nxt = [{k: q.get(k) for k in ("uid", "title", "company", "source", "kind")} for q in STATE["queue"][STATE["index"]:STATE["index"] + 8]]
         seen = STATE.get("ext_seen") or 0
-        return ({k: v for k, v in STATE.items() if k not in ("log", "queue", "parked", "job_commands", "final", "titles", "ext_seen")}
+        return ({k: v for k, v in STATE.items() if k not in ("log", "queue", "parked", "job_commands", "final", "titles", "ext_seen", "pending", "started_at")}
                 | {"log": STATE["log"][-200:], "parked": list(STATE["parked"].values()), "next": nxt,
+                   "waiting_for_browser": STATE.get("pending") is not None and STATE["running"],
                    "ext_seen_s": round(time.time() - seen) if seen else None})
 
 
@@ -587,8 +642,8 @@ def reset() -> dict[str, Any]:
     """The page's "Reset": the extension stopped answering (reloaded / browser closed). Ends this run in the app;
     a run still going in the browser is told to stop the next time it checks in."""
     with _lock:
-        STATE.update(running=False, current=None, waiting=None, command=None, paused=False, current_at=None,
-                     run_id=None, parked={}, job_commands={})
+        STATE.update(running=False, current=None, waiting=None, command=None, commands=[], paused=False, current_at=None,
+                     run_id=None, parked={}, job_commands={}, pending=None)
     _log("finished", None, "reset from the Auto-apply page")
     return status()
 
@@ -636,7 +691,7 @@ CONFIRMED = re.compile(
     re.I,
 )
 NEVER_CLICK = re.compile(
-    r"^\s*save\s*(job)?\s*$|follow|share|message|dismiss|discard|cancel|premium|sign ?(out|in|up)|log ?(out|in)|"
+    r"^\s*save\s*(job)?\s*$|^undo|follow|share|message|dismiss|discard|cancel|premium|sign ?(out|in|up)|log ?(out|in)|"
     r"create (an )?account|register|continue with (google|linkedin|facebook|apple)",
     re.I,
 )
@@ -659,6 +714,97 @@ ALREADY_TEXT = re.compile(r"you(?:'ve| have) already applied|already applied (?:
                           r"\bapplied\s+\d+\s*(?:minute|hour|day|week|month)s? ago", re.I)
 
 
+# The apply button on a job page, by board (aria-label or text). Only a button is ever matched (never a link),
+# and only when exactly one matches: two candidates = unusual page = the AI decides.
+_APPLY_BUTTON = {
+    "LinkedIn": re.compile(r"^easy apply( to this job)?$", re.I),
+    "Naukri": re.compile(r"^apply$", re.I),
+    "Indeed": re.compile(r"^(apply now|easily apply|apply)$", re.I),
+    "Wellfound": re.compile(r"^(apply|apply now|apply to .{2,60})$", re.I),
+    "Internshala": re.compile(r"^(apply now|apply)$", re.I),
+}
+_FORWARD_RANK = [  # when a step offers several forward buttons, the furthest one first
+    re.compile(r"^(submit|submit (your )?application|send application)$", re.I),
+    re.compile(r"^review( (your )?application)?$", re.I),
+    re.compile(r"^(next|continue|continue to next step|save and continue)$", re.I),
+]
+_SENT = re.compile(r"application sent|applied successfully|successfully applied|your application (has been |was )?sent|"
+                   r"you('ve| have) applied", re.I)
+
+
+def _label(it: dict[str, Any]) -> str:
+    return (it.get("text") or it.get("label") or "").strip()
+
+
+def _playbook(snap: dict[str, Any], items: list[dict[str, Any]], filled: bool, submitted: bool, source: str,
+              history: list[str] | None = None) -> dict[str, Any] | None:
+    full = snap.get("full_text", "")
+    dialog = bool(snap.get("dialog"))
+    if submitted and _SENT.search(snap.get("text", "") + " " + full[:3000]):
+        return {"action": "done", "key": "", "reason": "playbook: application sent shown"}
+    # Wellfound holds a sent application for a few minutes with an "Undo · 4:29" button (and may pop an optional
+    # "Share my AI interview" window): the Undo button IS the confirmation (Nov 12 live test). Never click it.
+    if submitted and any(re.match(r"^undo", _label(it), re.I) for it in items):
+        return {"action": "done", "key": "", "reason": "playbook: Wellfound shows Undo = application sent"}
+    # ...and once Send was clicked and the Send button is gone, the application is in (a follow-up "Share my AI interview" window may remain)
+    if submitted and source == "Wellfound" and not any(re.match(r"^send application$", _label(it), re.I) for it in items):
+        return {"action": "done", "key": "", "reason": "playbook: Wellfound Send application clicked and the form is gone"}
+    # Naukri: the recruiter question was answered and Saved, the drawer is gone: Naukri now shows "Applied" (live test Nov 12)
+    if source == "Naukri" and not dialog and history and "Naukri Save" in str(history[-1]):
+        return {"action": "done", "key": "", "reason": "playbook: Naukri question answered and saved"}
+    if not dialog and not submitted:
+        pat = _APPLY_BUTTON.get(source)
+        if pat:
+            hits = [it for it in items if it.get("tag") == "button" and (pat.match(_label(it)) or pat.match((it.get("label") or "").strip()))]
+            labels = [_label(it) for it in items if it.get("tag") != "a"]
+            # a company-site flow, or two apply buttons, is not the quick-apply template: let the AI look
+            # Wellfound shows the same apply action twice (header "Apply" + body "Apply now"): the first one is fine
+            if (len(hits) == 1 or (source == "Wellfound" and 1 < len(hits) <= 3)) and not any(re.search(r"company site|apply on", x, re.I) for x in labels):
+                return {"action": "click", "key": hits[0]["key"], "reason": f"playbook: {source} apply button", "is_submit": False}
+    # Indeed's apply flow is its own page (smartapply.indeed.com): contact -> resume -> questions -> review, each with
+    # one Continue / Submit button (the AI skipped the Submit on the review page twice: Nov 12 test).
+    if not dialog and "smartapply.indeed.com" in snap.get("url", "") and not submitted:
+        if snap.get("empty_fields") and not filled:
+            return {"action": "fill", "key": "", "reason": "playbook: Indeed form fields"}
+        btns = [it for it in items if it.get("tag") == "button"]
+        for rank in _FORWARD_RANK:
+            hit = [it for it in btns if rank.match(_label(it))]
+            if len(hit) == 1:
+                label = _label(hit[0])
+                return {"action": "click", "key": hit[0]["key"], "reason": f"playbook: Indeed {label[:30]}",
+                        "is_submit": bool(re.search(r"submit", label, re.I))}
+    if dialog:
+        inside = [it for it in items if it.get("in_dialog") and it.get("tag") != "a"]
+        # Naukri's recruiter questions (side drawer): radio options are labels, then a Save button. Answer the
+        # affirmative option ("Yes", "Yes - Interested"...), press Save, repeat for the next question. Anything that is
+        # not a plain choice (free text, "No" only...) stays with the AI / you.
+        if source == "Naukri":
+            opts = [it for it in inside if it.get("tag") == "label"]
+            save = [it for it in inside if re.match(r"^save$", _label(it), re.I)]
+            last = str((history or [""])[-1])
+            if save and "Naukri option" in last:
+                return {"action": "click", "key": save[0]["key"], "reason": "playbook: Naukri Save", "is_submit": False}
+            if opts and "Naukri option" not in last:
+                yes = [o for o in opts if re.match(r"^\s*(yes|interested|i am|i have|available)", _label(o), re.I)]
+                if yes:
+                    return {"action": "click", "key": yes[0]["key"], "reason": f"playbook: Naukri option {_label(yes[0])[:20]}", "is_submit": False}
+        if snap.get("fields") and not filled:
+            return {"action": "fill", "key": "", "reason": "playbook: form fields in the dialog"}
+        if filled or not snap.get("fields"):
+            for rank in _FORWARD_RANK:
+                hit = [it for it in inside if rank.match(_label(it))]
+                if len(hit) == 1:
+                    label = _label(hit[0])
+                    return {"action": "click", "key": hit[0]["key"], "reason": f"playbook: {label[:30]}",
+                            "is_submit": bool(re.search(r"submit|send application", label, re.I))}
+            # LinkedIn's last screen: "Application sent" + a Done button
+            if submitted:
+                done = [it for it in inside if re.match(r"^(done|close)$", _label(it), re.I)]
+                if done and _SENT.search(snap.get("text", "")):
+                    return {"action": "done", "key": "", "reason": "playbook: application sent"}
+    return None
+
+
 def decide(body: dict[str, Any]) -> dict[str, Any]:
     """Next action for the extension, from a page snapshot. Every step is written to autoapply_steps.jsonl."""
     began = time.time()
@@ -674,7 +820,9 @@ def decide(body: dict[str, Any]) -> dict[str, Any]:
             f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "uid": (body.get("job") or {}).get("uid"),
                                 "url": (snap.get("url") or "")[:200], "action": out.get("action"), "key": out.get("key"),
                                 "reason": (out.get("reason") or "")[:200], "items": len(snap.get("items") or []),
-                                "filled": bool(body.get("filled")), "s": round(time.time() - began, 1)}, ensure_ascii=False) + "\n")
+                                "filled": bool(body.get("filled")), "s": round(time.time() - began, 1),
+                                "dialog": bool(snap.get("dialog")), "fields": snap.get("fields"),
+                                "dlg": [(i.get("key"), (i.get("text") or i.get("label") or "")[:25], i.get("tag")) for i in (snap.get("items") or []) if i.get("in_dialog")][:14]}, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 — logging never breaks a run
         pass
     return out
@@ -702,12 +850,31 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
 
     items = snap.get("items") or []
 
+    # No progress: the same action repeated again and again (a disabled Send button, a US-only job...) ends the job
+    # instead of looping until the time limit.
+    last = [str(h) for h in history[-6:]]
+    ai_loop = len(last) >= 4 and len(set(last[-4:])) == 1 and "playbook" not in last[-1]
+    if ai_loop or (len(last) >= 6 and len(set(last)) == 1):
+        return {"action": "skip", "key": "", "reason": "no progress: the same step repeated and nothing changed (button disabled or not applicable)"}
+
+    # After our own Submit click, a board that now shows "Already applied" / "Applied" confirms it (Internshala has no
+    # confirmation text: Nov 12 the application went through but was logged as skipped).
+    if submitted and any(ALREADY_BTN.match((it.get("text") or it.get("label") or "").strip()) for it in items if it.get("tag") != "a"):
+        return {"action": "done", "key": "", "reason": "button now says Applied after submit"}
+
     # Already applied (Internshala shows an "Applied" button / "already applied", LinkedIn "Applied X ago",
     # Naukri "Applied"): done, no AI call. Before any submit only, so our own confirmation isn't mistaken for it.
     if not submitted and not filled:
-        labels = [(it.get("text") or it.get("label") or "").strip() for it in items]
-        if any(ALREADY_BTN.match(x) for x in labels) or ALREADY_TEXT.search(full):
+        # buttons only: a sidebar LINK "Applied" (Wellfound's nav) is the list of your applications, not this job's state
+        labels = [(it.get("text") or it.get("label") or "").strip() for it in items if it.get("tag") != "a"]
+        if any(ALREADY_BTN.match(x) for x in labels) or ALREADY_TEXT.search(full) or snap.get("already"):
             return {"action": "skip", "key": "", "reason": "already applied to this job earlier"}
+
+    # Site playbooks (Nov 12): these boards' quick-apply flows are fixed templates, so the usual steps need no AI
+    # call (each one cost ~2-15 s). Anything unusual still falls through to the AI below.
+    quick = _playbook(snap, items, filled, submitted, (body.get("job") or {}).get("source", ""), history)
+    if quick:
+        return quick
 
     # Obvious step, no AI call: inside a dialog, nothing left to fill, and exactly one forward button.
     if snap.get("dialog") and (filled or not snap.get("fields")):

@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FresherPilot · Profile</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/ui.css" />
+    <script src="/static/ui.js"></script>
     <style>
       .page { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
       .page h1 { margin: 0 0 4px; font-size: 1.3rem; }
@@ -28,12 +30,12 @@
     </style>
   </head>
   <body>
+    <div id="appnav" data-active="profile"></div>
     <div class="page">
-      <p><a href="/">← FresherPilot</a></p>
       <h1>Applicant profile</h1>
       <p class="muted">Used to fill application forms (browser extension) and to write cover letters and answers.
         Highlighted fields are empty: forms asking for them will be left for you to fill.</p>
-      <form id="form"></form>
+      <form id="form"><div class="sk-card"><div class="sk sk-line w40"></div><div class="sk sk-line w80"></div><div class="sk sk-line w60"></div></div><div class="sk-card"><div class="sk sk-line w40"></div><div class="sk sk-line w80"></div></div></form>
       <div class="bar">
         <button type="button" id="save" class="btn primary">Save profile</button>
         <span id="msg" class="muted"></span>

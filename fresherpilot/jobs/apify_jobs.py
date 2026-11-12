@@ -144,6 +144,10 @@ def _naukri_feed(item: dict[str, Any]) -> dict[str, Any] | None:
     title = item.get("title")
     if not title or _NAUKRI_NOT_TECH.search(str(item.get("functionalArea") or "")):
         return None
+    # Internships come with a job-like title, "0-2 years" and employmentType "Full Time, Permanent": only
+    # jobType / the internship block tell them apart (Nov 6: Allerin "Junior Software Developer", 3 months unpaid).
+    if "intern" in str(item.get("jobType") or "").lower() or item.get("internship"):
+        return None
     skills = item.get("skills") if isinstance(item.get("skills"), list) else []
     return {
         "id": str(item["jobId"]),
@@ -658,6 +662,12 @@ def _slug(city: str) -> str:
 
 
 _REMOTE = re.compile(r"remote|work from home|\bwfh\b|anywhere")
+# "United States, Remote" / "Berlin, Remote": remote for people living there, not for you (Wellfound's pages say "hires
+# remotely in United States" / "requires all remote workers to be in-country"). Back-tested Nov 12: 20 approved jobs, all Wellfound.
+_FOREIGN = re.compile(r"united states|\busa?\b|u\.s\.|united kingdom|\buk\b|canada|europe|emea|germany|france|london|new york|san francisco|"
+                      r"california|texas|toronto|berlin|amsterdam|dublin|ireland|singapore|australia|sydney|dubai|\buae\b|latam|brazil|"
+                      r"mexico|netherlands|spain|portugal|poland|israel|north america|\bnyc\b|seattle|boston|austin|chicago|los angeles|"
+                      r"vancouver|hong kong|japan|tokyo|thailand")
 # Open to every city: Telegram drives say "PAN India", "Across India", "Virtual Drive (Webex)". Nov 5: the city
 # filter rejected Infosys / HCLTech / Cognizant / Sutherland fresher drives as "other city" because of this.
 _NATIONWIDE = re.compile(r"\bpan[\s-]*india\b|\b(across|all over|all|anywhere in|throughout)\s+india\b|"
@@ -674,11 +684,13 @@ def in_wanted_location(job: dict[str, Any]) -> bool:
     loc = str(job.get("location") or "").lower()
     if not loc.strip() or loc.strip(" ,") in ("india", "in"):
         return True
+    words = {w for c in cities for w in cfg.CITY_ALIASES.get(c.lower(), [c.lower()])}
+    if _FOREIGN.search(loc) and "india" not in loc and not any(w in loc for w in words):
+        return False
     if remote and _REMOTE.search(loc):
         return True
     if _NATIONWIDE.search(loc):
         return True
-    words = {w for c in cities for w in cfg.CITY_ALIASES.get(c.lower(), [c.lower()])}
     return any(w in loc for w in words)
 
 

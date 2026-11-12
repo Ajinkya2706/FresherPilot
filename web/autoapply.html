@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FresherPilot · Auto-apply</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/ui.css" />
+    <script src="/static/ui.js"></script>
     <style>
       .aa { max-width: 1100px; margin: 0 auto; padding: 16px; }
       .aa .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 12px 0; }
@@ -51,12 +53,11 @@
     </style>
   </head>
   <body>
+    <div id="appnav" data-active="autoapply"></div>
     <main class="aa">
-      <header class="brand"><span class="logo" aria-hidden="true">JF</span>
-        <div><h1>Auto-apply</h1><p class="tagline" id="state">Loading…</p></div>
-        <div class="row" style="margin-left:auto"><a class="btn" href="/">← Jobs</a></div>
-      </header>
+      <h1 style="margin:4px 0 0">Auto-apply</h1><p class="muted" id="state" style="margin:2px 0 12px">Loading…</p>
 
+      <div id="extWarn" class="panel" hidden style="border-color:#d97706"></div>
       <div id="alert" class="panel" hidden style="border-color:#d97706"></div>
       <section class="panel">
         <div id="chooser">

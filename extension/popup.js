@@ -19,10 +19,12 @@ async function checkServer() {
   if (!res.ok) {
     const msg = /sign in/i.test(res.error || "") ? res.error : `Can't reach the FresherPilot app at ${server}. Start it with <b>python main.py</b>.`;
     $("server").innerHTML = `<span class="err">${msg}</span>`;
+    $("pill").textContent = "Not connected"; $("pill").className = "pill bad";
     $("fill").disabled = true;
     return;
   }
-  $("server").textContent = "Connected to FresherPilot.";
+  $("server").textContent = "Ready: open a job application form and press Fill.";
+  $("pill").textContent = "Connected"; $("pill").className = "pill ok";
   $("fill").disabled = false;
   showMissing(res.data.missing || []);
 }

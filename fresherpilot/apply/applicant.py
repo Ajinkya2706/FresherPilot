@@ -165,12 +165,18 @@ def match_option(value: str, options: list[str]) -> str:
 def _limits(field: dict[str, Any]) -> tuple[int | None, int | None]:
     """(max chars, max words) from maxlength and from hints like "(max 500 characters)"."""
     max_chars = field.get("maxlength") if isinstance(field.get("maxlength"), int) and field.get("maxlength") > 0 else None
-    text = f"{field.get('label', '')} {field.get('hint', '')}"
+    text = f"{field.get('label', '')} {field.get('hint', '')} {field.get('placeholder', '')}"
     m = re.search(r"(\d{2,5})\s*(?:characters|chars|character)", text, re.I)
     if m:
         max_chars = min(max_chars or 10**9, int(m.group(1)))
     w = re.search(r"(\d{1,4})\s*words", text, re.I)
-    return max_chars, int(w.group(1)) if w else None
+    max_words = int(w.group(1)) if w else None
+    # "~2/3 lines", "2-3 lines", "in 3 sentences": about 18 words a line, 25 a sentence
+    ln = re.search(r"(?:(\d)\s*(?:/|-|to|or)\s*)?(\d)\s*(lines?|sentences?)", text, re.I)
+    if ln and not max_words:
+        n = int(ln.group(2))
+        max_words = n * (18 if ln.group(3).lower().startswith("line") else 25)
+    return max_chars, max_words
 
 
 def _fit_length(text: str, max_chars: int | None, max_words: int | None) -> str:
@@ -201,10 +207,10 @@ def _profile_rules(profile: dict[str, Any]) -> list[tuple[re.Pattern[str], str]]
         (r"^(full )?name$|^your (full )?name|^full name|^candidate name|^applicant name|^legal name", p["full_name"]),
         (r"e-?mail", p["email"]),
         (r"country code|dial code", p["phone_country_code"]),
-        (r"phone|mobile|contact number|whatsapp|cell", phone_full),
+        (r"\bphone\b|\bmobile\b|contact number|whatsapp|\bcell\b", phone_full),
         (r"linked ?in", links["linkedin"]),
         (r"git ?hub", links["github"]),
-        (r"portfolio|personal (web)?site|^website|blog|other (url|link)", links["portfolio"]),
+        (r"portfolio|personal (web)?site|^website|\bblog\b|other (url|link)", links["portfolio"]),
         (r"leet ?code", links.get("leetcode", "")),
         (r"^(current )?city|current location|^location$|city of residence|where are you (currently )?(based|located)", p["city"]),
         (r"^state|province", p["state"]),
@@ -212,13 +218,13 @@ def _profile_rules(profile: dict[str, Any]) -> list[tuple[re.Pattern[str], str]]
         (r"pin ?code|postal|zip", p.get("pincode", "")),
         (r"date of birth|\bdob\b|birth date", p.get("date_of_birth", "")),
         (r"nationality|citizenship", p.get("nationality", "")),
-        (r"notice period|joining time|how soon can you join|earliest (start|joining)", prefs["notice_period"]),
+        (r"notice period|joining time|how (soon|quickly|fast) can you join|when can you join|earliest (start|joining)", prefs["notice_period"]),
         (r"current (ctc|salary|compensation|package)", "CTC:" + str(prefs["current_ctc_lpa"])),
         (r"expected (ctc|salary|compensation|package)|salary expectation", "CTC:" + str(prefs.get("expected_ctc_lpa", "") or "")),
         (r"total (years of )?(work )?experience|years of (professional )?experience|total exp", prefs["total_experience_years"]),
         (r"current (company|employer|organisation|organization)", prefs.get("current_company", "")),
-        (r"(cgpa|gpa|cpi)(?!.*(12|xii|10th|x\b))", edu.get("cgpa", "")),
-        (r"(year of (passing|graduation)|graduation year|passing year|batch)", prefs["graduation_year"]),
+        (r"\b(cgpa|gpa|cpi)\b(?!.*(12|xii|10th|x\b))", edu.get("cgpa", "")),
+        (r"(year of (passing|graduation)|graduation year|passing year|\bbatch\b(?! size))", prefs["graduation_year"]),
         (r"(college|university|institute|school) name|^(college|university|institution)$", edu.get("institution", "")),
         (r"^(highest )?(degree|qualification|education)$", f"{edu.get('degree', '')} {edu.get('field', '')}".strip()),
         (r"^(field of study|branch|specialization|specialisation|major|stream|discipline)", edu.get("field", "")),
@@ -251,6 +257,26 @@ def _ctc_for(field: dict[str, Any], raw: str) -> str:
     return f"{value:g}" if value < 1000 else str(int(round(value)))
 
 
+def _shortest_notice(options: list[str]) -> str:
+    """Immediate joiner: the option with the shortest time (Immediate / 0-15 days / 1 week...)."""
+    best, best_days = "", 10**6
+    for o in options:
+        n = _norm(o)
+        if re.search(r"immediate|right away|asap|now|no notice", n):
+            return o
+        m = re.search(r"(\d+(?:\.\d+)?)", n)
+        if not m:
+            continue
+        days = float(m.group(1)) * (30 if "month" in n else 7 if "week" in n else 1)
+        if days < best_days:
+            best, best_days = o, days
+    return best
+
+
+_HEADING = re.compile(r"^(application|personal|contact|additional|other|general|supporting|candidate) ?(details|information|info|preferences|documents|section)?$|"
+                      r"^(details|information|preferences|documents|background|motivation|summary)$", re.I)
+
+
 def _direct_answer(field: dict[str, Any], rules: list[tuple[re.Pattern[str], str]]) -> str | None:
     """Answer from the profile if the field is a standard one. None = not a standard field."""
     label = _norm(field.get("label") or "")
@@ -266,6 +292,8 @@ def _direct_answer(field: dict[str, Any], rules: list[tuple[re.Pattern[str], str
                 if not field.get("options"):
                     return value or ""
                 chosen = match_option(value, field.get("options") or [])
+                if not chosen and re.search(r"notice|join", label) and re.search(r"immed|0", value, re.I):
+                    chosen = _shortest_notice(field.get("options") or [])
                 return chosen if chosen else None  # no confident match -> ask the AI
             return value or ""
     return None
@@ -299,6 +327,17 @@ AUTOFILL_RULES = """You fill in a job application form on behalf of the candidat
 Use ONLY facts from the PROFILE and RESUME. Never invent experience, employers, numbers, skills or credentials,
 and never add specifics the resume doesn't state (model versions, team sizes, metrics, tools).
 Name tools exactly as the resume does (if it says "GPT", write "GPT", not "GPT-4").
+
+The block "APPLYING FOR" (or the JOB text) names the ROLE and COMPANY of this application. Whenever an answer mentions
+the role or company, use exactly those; never take them from the form page's header, ads or other jobs. If the job is
+unknown, do not name a role or company.
+Written answers with no word/character limit: 40-90 words, direct, no repetition and no second paragraph.
+When a form asks which roles/positions to apply for (checkboxes, multi-select), choose ONLY roles that fit the
+candidate's target (software / backend / AI-ML / data / automation / engineering). Never tick sales, growth, marketing,
+business-development, operations or "founder's office" roles. If none fits, return "" with needs_review=true.
+Notice period / joining time: the candidate is an immediate joiner, so pick the SHORTEST option.
+Each answer must come from its own field's question only. Never put an essay answer into a short field (salary, CTC,
+notice period, experience, name, link): those get a short value or "" with needs_review=true.
 
 For each field return {id, value, needs_review}:
 - Free text (text/textarea): answer in first person, specific and genuine, using the candidate's real projects and
@@ -523,6 +562,8 @@ def _llm_batch(batch: list[dict[str, Any]], profile_text: str, job_context: str)
         extra = " ".join(str(f.get(k))[:150] for k in ("hint", "placeholder") if f.get(k))
         if extra:
             bits.append(f"hint: {extra}")
+        if f.get("attr"):
+            bits.append(f"input name: {f['attr']}")
         if max_chars:
             bits.append(f"max {max_chars} chars")
         if max_words:
@@ -545,8 +586,10 @@ def _llm_batch(batch: list[dict[str, Any]], profile_text: str, job_context: str)
             user += "JD KEYWORDS NOT IN THE RESUME (never claim them): " + ", ".join(lacking) + "\n"
         user += "\n"
     elif job_context:  # short answers still depend on the job (its city, role, notice period asked...)
-        user += f"JOB (summary):\n{job_context[:700]}\n\n"
-    user += "FIELDS (id | type | question | ...):\n" + "\n".join(lines) + "\n\nOne answer per field id."
+        user += f"JOB (summary):\n{job_context[:900]}\n\n"
+    user += ("FIELDS (id | type | question | ...):\n" + "\n".join(lines) +
+             "\n\nOne answer per field id. Answer EACH field only from its own question (and 'input name'); never reuse "
+             "the answer of another field. A salary/CTC/notice/number field gets a short number or value, never a paragraph.")
     content, _model = llm_filter._create(
         client, [{"role": "system", "content": AUTOFILL_RULES}, {"role": "user", "content": user}],
         schema=AUTOFILL_SCHEMA, name="form_answers",
@@ -601,9 +644,52 @@ def _phone_for(field: dict[str, Any], profile: dict[str, Any]) -> str:
     return full
 
 
-def autofill(fields: list[dict[str, Any]], job_context: str = "") -> list[dict[str, Any]]:
+def job_header(job: dict[str, Any]) -> str:
+    """Facts about the job being applied to, put first in every AI request."""
+    company = job.get("employer") or job.get("company") or ""
+    return (f"APPLYING FOR (use exactly these when a field asks the role or company):\n"
+            f"ROLE: {job.get('title', '')}\nCOMPANY: {company}\nLOCATION: {job.get('location', '')}\n"
+            f"BOARD JOB ID: {job.get('id', '')} (the job board's id, not necessarily the company's)\n\nJOB DESCRIPTION:\n")
+
+
+_JOB_ROLE = re.compile(r"(position|role|job title|post|vacancy|designation|opening|job) (you are |you.re |being )?(appl\w+|desired|interested|applied)( for| to)?$"
+                       r"|^(applying|applied) for$|^(job|position|role|vacancy) (title|applied|name)$|^desired (position|role|job)$"
+                       r"|^position$|^job title$|^role$")
+_JOB_COMPANY = re.compile(r"^(company|organi[sz]ation|employer) (name )?(you are |you.re )?(applying|applied)( to| for)?$|^applying (to|at)$|^company applying (to|for)$")
+_NUMERIC_LABEL = re.compile(r"\b(ctc|salary|compensation|package|lpa|lakh|notice|years? of|experience in years|cgpa|gpa|percentage|marks|pincode|zip|age)\b", re.I)
+
+
+def _job_answer(f: dict[str, Any], job: dict[str, Any] | None) -> str | None:
+    """Role / company the form asks for, straight from the matched job (never from the AI)."""
+    if not job or f.get("type") in ("checkbox", "checkbox_group", "file", "radio"):
+        return None
+    label = _norm(f.get("label") or "")
+    if not label or len(label) > 60:
+        return None
+    if f.get("type") in ("select", "combobox") and f.get("options"):
+        return None  # options must be matched; the AI sees the job header
+    if _JOB_ROLE.search(label):
+        return str(job.get("title") or "") or None
+    if _JOB_COMPANY.search(label):
+        return str(job.get("employer") or job.get("company") or "") or None
+    return None
+
+
+def _sanity(f: dict[str, Any], a: dict[str, Any], essay: bool) -> None:
+    """Drop an answer that obviously belongs to another field (a paragraph in a salary box...)."""
+    value = str(a.get("value") or "")
+    if not value or a.get("source") == "profile":
+        return
+    hint = f"{f.get('label', '')} {f.get('placeholder', '')} {f.get('attr', '')}"
+    too_long = len(value) > 120 and (not essay or bool(_NUMERIC_LABEL.search(hint)))
+    wordy_number = bool(_NUMERIC_LABEL.search(hint)) and len(value) > 40 and not re.search(r"\d", value[:20])
+    if too_long or wordy_number or (f.get("type") in ("text", "number") and len(value) > 300):
+        a.update(value="", needs_review=True, note="answer didn't fit this field")
+
+
+def autofill(fields: list[dict[str, Any]], job_context: str = "", job: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Answers for a list of form fields: [{id, value, source, needs_review}]."""
-    answers_out = _autofill(fields, job_context)
+    answers_out = _autofill(fields, job_context, job)
     by_id = {f["id"]: f for f in fields}
     profile = load_profile()
     decline = re.compile(r"prefer not|decline|don.?t wish|do not wish|not (to )?(say|disclose|answer)|rather not", re.I)
@@ -627,7 +713,7 @@ def autofill(fields: list[dict[str, Any]], job_context: str = "") -> list[dict[s
     return answers_out
 
 
-def _autofill(fields: list[dict[str, Any]], job_context: str = "") -> list[dict[str, Any]]:
+def _autofill(fields: list[dict[str, Any]], job_context: str = "", job: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     profile = load_profile()
     rules = _profile_rules(profile)
     answers: dict[str, dict[str, Any]] = {}
@@ -636,7 +722,7 @@ def _autofill(fields: list[dict[str, Any]], job_context: str = "") -> list[dict[
         if f.get("type") == "file":
             continue
         custom = next((v for q, v in profile.get("custom_answers", {}).items() if _norm(q) and _norm(q) == _norm(f.get("label", ""))), None)
-        direct = custom if custom is not None else _direct_answer(f, rules)
+        direct = custom if custom is not None else (_job_answer(f, job) or _direct_answer(f, rules))
         if direct is None:
             for_ai.append(f)
         else:
@@ -654,6 +740,14 @@ def _autofill(fields: list[dict[str, Any]], job_context: str = "") -> list[dict[
         a = ai.get(f["id"], {})
         value = _clean(f, a.get("value", ""))
         answers[f["id"]] = {"id": f["id"], "value": value, "source": "ai", "needs_review": bool(a.get("needs_review")) or not value}
+        _sanity(f, answers[f["id"]], _is_essay(f))
+        lab = _norm(f.get("label") or "")
+        if (_is_essay(f) and answers[f["id"]]["value"] and "?" not in (f.get("label") or "") and not f.get("placeholder")
+                and (_HEADING.match(lab) or len(lab.split()) <= 2)):
+            # a section title, not a question: nothing to answer
+            answers[f["id"]].update(value="", needs_review=True, note="no question found for this box")
+        elif _is_essay(f) and "exact job is unknown" in job_context and answers[f["id"]]["value"]:
+            answers[f["id"]]["needs_review"] = True  # written for a company the app couldn't confirm: read it first
     return [answers[f["id"]] for f in fields if f["id"] in answers]
 
 

@@ -75,7 +75,7 @@
     return clean(clone.textContent);
   }
 
-  function nearbyQuestion(el, maxControls = 2) {
+  function nearbyQuestion(el, maxControls = 1) {  // 1 = only containers holding just this control (never a neighbour's question)
     let node = el;
     for (let i = 0; i < 6 && node; i++) {
       node = node.parentElement;
@@ -278,7 +278,8 @@
       let ftype = tag === "textarea" ? "textarea" : ["email", "tel", "url", "number", "date", "month"].includes(type) ? type : "text";
       if (isCombo) ftype = "combobox";
       if (ftype === "tel") ftype = "text";
-      const field = { label, hint: hintFor(el), placeholder: clean(el.placeholder), required: isRequired(el, label) };
+      const field = { label, hint: hintFor(el), placeholder: clean(el.placeholder), required: isRequired(el, label),
+                      attr: clean(`${el.name || ""} ${el.id && !/^jf\d+$/.test(el.id) ? el.id : ""}`).slice(0, 80) };
       const ml = parseInt(el.getAttribute("maxlength"), 10);
       if (ml > 0 && ml < 100000) field.maxlength = ml;
       if (isCombo) {
@@ -349,7 +350,11 @@
   }
 
   function closeDropdown(el) {
-    el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape", code: "Escape" }));
+    // Escape bubbles up: inside LinkedIn's Easy Apply <dialog> it CLOSES the whole application ("Save this application?").
+    // So only a custom dropdown that is really open gets it, never a native <select> or a closed combobox.
+    if (el.tagName !== "SELECT" && el.getAttribute("aria-expanded") === "true") {
+      el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape", code: "Escape" }));
+    }
     if (document.activeElement === el) el.blur();
   }
 
@@ -477,6 +482,9 @@
   window.__jobFinderFill = async (overwrite) => {
     const summary = { found: 0, filled: 0, review: 0, files: 0, already: 0, job: null, error: null, missing_profile: [] };
     try {
+      // Job SEARCH / listing pages have filter boxes, not an application: never type into them (Nov 12: Naukri's
+      // search filters were "filled" with profile data).
+      if (/naukri\.com\/[^?#]*-jobs(-in-[^?#/]*)?\/?(\?|#|$)|linkedin\.com\/jobs\/(search|collections)|indeed\.com\/(jobs|q-)|wellfound\.com\/(role|jobs)\/?(\?|$)|internshala\.com\/jobs\/?$/i.test(location.href)) return summary;
       let fields = collect(overwrite);
       // Forms that are still loading (single-page apps, popups): wait up to ~5 s, in the main page or
       // in a frame that has form controls.

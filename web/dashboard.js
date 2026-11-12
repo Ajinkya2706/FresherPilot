@@ -236,6 +236,7 @@ detailEl.addEventListener("click", (e) => {
   if (open) openedUid = open.dataset.open;
 });
 document.addEventListener("visibilitychange", () => {
+  return;  // opening a job now marks it applied at once; "Didn't apply?" undoes it (no question needed)
   if (document.hidden || !openedUid) return;
   const job = findJob(openedUid);
   openedUid = null;

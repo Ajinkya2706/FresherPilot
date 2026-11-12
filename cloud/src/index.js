@@ -113,7 +113,26 @@ function titleExcluded(title) {  // llm_filter.title_excluded
   return null;
 }
 
+// llm_filter.ai_reads_years_posts: a post that lists years ("3-5 yrs") is no longer rejected free: the AI (facts.fresh) reads it,
+// unless the title says Senior/Lead/... or the setting is off (a keyword list misses rewordings such as "0 experience allowed").
+function aiReadsYearsPosts(job) {
+  if (CONFIG.skilled_freshers === false) return false;
+  if (/\b(?:senior|sr|lead|principal|staff|head|director|manager|architect)\b/i.test(String(job.title || ""))) return false;
+  return String(job.description || "").length >= 80;
+}
+
+function blockedCompany(company) {  // llm_filter.blocked_company: all words of an entry appear in the name
+  const have = new Set(String(company || "").toLowerCase().match(/[a-z0-9]+/g) || []);
+  for (const e of CONFIG.blocked_companies || []) {
+    const w = String(e).toLowerCase().match(/[a-z0-9]+/g) || [];
+    if (w.length && w.every((x) => have.has(x))) return e;
+  }
+  return "";
+}
+
 function boardReject(job) {  // llm_filter._board_reject (stretch jobs off)
+  const blocked = blockedCompany(job.company);
+  if (blocked) return ["blocked_company", `Blocked company: ${blocked}`];
   const words = titleExcluded(job.title);
   if (words) return words;
   const level = String(job.experience || "");
@@ -122,7 +141,10 @@ function boardReject(job) {  // llm_filter._board_reject (stretch jobs off)
   // recruiter-refreshed listings 15-30+ days old (109 approved-but-old in a day).
   if (job.posted_days != null && +job.posted_days > CONFIG.posted_within_days) return ["too_old", `posted ${job.posted_days} days ago`];
   const m = level.match(/^\s*(\d+(?:\.\d+)?)\s*(?:-\s*\d+\s*|\+\s*)years/i);
-  if (m && parseFloat(m[1]) >= CONFIG.reject_from_years + (CONFIG.stretch_jobs ? 1 : 0)) return ["needs_experience", level];
+  if (m && parseFloat(m[1]) >= CONFIG.reject_from_years + (CONFIG.stretch_jobs ? 1 : 0)) {
+    if (aiReadsYearsPosts(job)) return null;  // the AI reads the post: "3-5 yrs" may still welcome freshers
+    return ["needs_experience", level];
+  }
   return null;
 }
 
@@ -138,7 +160,9 @@ function decide(f, job) {  // llm_filter.decide
   if (!["full_time", "unclear"].includes(f.employment_type)) return ["reject", "not_full_time"];
   const rf = CONFIG.reject_from_years;
   const low = typeof years === "number" && years < rf;
-  if (!["entry", "unclear"].includes(f.seniority) && !(f.seniority === "mid" && (freshers || low))) return ["reject", "too_senior"];
+  const guess = ["mid", "senior"].includes(f.seniority) && (years === null || years === undefined) && !String(f.experience_evidence || "").trim() &&
+    !/senior|lead|principal|staff|manager|head|architect|\b(?:ii|iii|iv|2|3|4)\s*$/i.test(String(job.title || ""));  // model's guess from a short post: let the fit check judge
+  if (!["entry", "unclear"].includes(f.seniority) && !guess && !(f.seniority === "mid" && (freshers || low))) return ["reject", "too_senior"];
   if (/director|executive/i.test(level)) return ["reject", "too_senior"];
   if (/mid-senior/i.test(level) && !(freshers || low)) return ["reject", "too_senior"];
   if (!ALLOWED_ROLES.has(f.role_type)) return ["reject", f.role_type === "non_software_engineering" ? "non_software_engineering" : "non_developer"];
@@ -170,11 +194,14 @@ const uidOf = (job) => `${job.source}:${job.id}`;
 
 const REMOTE = new RegExp(CONFIG.remote_regex, "i");
 const NATIONWIDE = new RegExp(CONFIG.nationwide_regex || "$^", "i");
+const FOREIGN = CONFIG.foreign_regex ? new RegExp(CONFIG.foreign_regex, "i") : null;
 function inWantedLocation(job) {  // apify_jobs.in_wanted_location: unknown / "India"-only locations stay
   const words = CONFIG.city_words || [];
   if (!words.length && !CONFIG.remote_ok) return true;
   const loc = String(job.location || "").toLowerCase();
   if (!loc.trim() || ["india", "in"].includes(loc.trim().replace(/^[ ,]+|[ ,]+$/g, ""))) return true;
+  // "United States, Remote" / "Berlin, Remote" is not remote for you (apify_jobs._FOREIGN, back-tested)
+  if (FOREIGN && FOREIGN.test(loc) && !loc.includes("india") && !words.some((w) => loc.includes(w))) return false;
   if (CONFIG.remote_ok && REMOTE.test(loc)) return true;
   if (NATIONWIDE.test(loc)) return true;  // "PAN India", "Across India", "Virtual Drive": open to every city
   return words.some((w) => loc.includes(w));
@@ -572,6 +599,9 @@ function apifyJobsDue(st, env) {
   return due.sort((a, b) => (last[a.key] || 0) - (last[b.key] || 0));  // longest waiting first
 }
 
+// Naukri lists internships (unpaid / stipend, "3 months duration") under job-like titles with "0-2 years" and
+// employmentType "Full Time, Permanent"; only jobType / the internship block tell (Nov 6: Allerin "Junior Software Developer").
+const isNaukriIntern = (x) => /intern/i.test(String(x.jobType || "")) || (x.internship && typeof x.internship === "object" && Object.keys(x.internship).length > 0);
 const mapNaukri = (x) => ({
   id: String(x.jobId), source: "Naukri", title: decode(x.title), company: x.companyName || "Unknown", location: x.location || "",
   experience: String(x.experienceText || "Not specified").replace("Yrs", "years").replace("Yr", "year"), posted: x.createdDate || "",
@@ -614,7 +644,7 @@ async function srcApify(env, b) {
       const items = await (await b.fetch(`${APIFY}/datasets/${info.defaultDatasetId}/items?clean=true&offset=${run.offset || 0}&limit=60`, auth)).json();
       const list = Array.isArray(items) ? items : [];
       const notTech = new RegExp(CONFIG.naukri_not_tech, "i");
-      const jobs = key.startsWith("naukri") ? list.filter((x) => x.title && x.jobId && !notTech.test(x.functionalArea || "")).map(mapNaukri)
+      const jobs = key.startsWith("naukri") ? list.filter((x) => x.title && x.jobId && !isNaukriIntern(x) && !notTech.test(x.functionalArea || "")).map(mapNaukri)
                  : key === "indeed" ? list.filter((x) => x.title).map(mapIndeed)
                  : list.filter((x) => x.title).map(mapLinkedIn).map((j) => key === "li:Remote" ? { ...j, location: remoteLoc(j.location) } : j);
       added = await addJobs(env, jobs);
@@ -828,7 +858,7 @@ async function aiStep(env, b) {
     let looks = 0;
     for (const [j] of passing) {
       const ft = fits[j.id];
-      if (!ft || (["strong", "partial"].includes(ft.fit) && ft.code !== false) || looks >= 2 || b.left < 8) continue;
+      if (!ft || ft.code !== false || looks >= 2 || b.left < 8) continue;
       looks++;
       try {
         const res = await groq(env, b, CONFIG.fit_prompt + "\n\n" + CONFIG.second_look,
@@ -849,7 +879,7 @@ async function aiStep(env, b) {
       if (!ft) { stmts.push(env.DB.prepare("UPDATE jobs SET tries = tries + 1 WHERE id = ?").bind(j.id)); return; }
       fit = JSON.stringify(ft);
       if (ft.code === false) { status = "reject"; category = "non_developer"; reason = ft.why || reason; }
-      else if (!["strong", "partial"].includes(ft.fit)) { status = "reject"; category = "off_stack"; reason = ft.why || reason; }
+      // Nov 12: an unfamiliar stack is not a reason to reject a developer role (only non-developer / not-fresher are)
       else kept.push({ ...j, facts: v.f, fitv: ft });
     }
     stmts.push(env.DB.prepare("UPDATE jobs SET status = ?, category = ?, reason = ?, fit = ?, facts = ? WHERE id = ?")
@@ -874,6 +904,19 @@ const MODE_BY_SOURCE = { Internshala: "easy", Wellfound: "easy", Careers: "site"
 function applyMode(j) { return j.apply_mode || MODE_BY_SOURCE[j.source] || ""; }
 const MODE_LABEL = { easy: "📱 Easy Apply", site: "💻 Company site" };
 
+// Telegram alerts are for FRESH jobs only. The AI/stored list may keep jobs up to posted_within_days (3), but an alert
+// for a 2-3 day old post is a wasted tap (the opening may be closed). Age = real posting time when the source gives one,
+// else (read time + "posted within N min"), else the posting date (date-only: LinkedIn/Indeed "yesterday" = < 48 h).
+const ALERT_MAX_HOURS = 30;
+function alertTooOld(j) {
+  const p = String(j.posted || "");
+  let hours = null;
+  if (p.includes("T") && !p.includes("T00:00:00") && !isNaN(Date.parse(p))) hours = (Date.now() - Date.parse(p)) / 3600000;
+  else if (j.within_min != null && j.found_at) hours = ((Date.now() - j.found_at) / 60000 + Number(j.within_min)) / 60;
+  if (hours != null) return hours > ALERT_MAX_HOURS;
+  return j.posted_days != null && +j.posted_days >= 2;
+}
+
 function jobText(j) {  // same look as the laptop app's alerts
   const f = j.facts || {}, ft = j.fitv || {};
   const years = f.min_years_required;
@@ -893,14 +936,25 @@ function jobText(j) {  // same look as the laptop app's alerts
   const lines = [`🆕 <b>${esc(j.title)}</b>`, `🏢 ${esc(j.company)}` + (j.location ? `  ·  📍 ${esc(j.location)}` : ""),
                  [exp && `🎓 ${esc(exp)}`, posted && `🕒 ${posted}`, `via ${esc(j.source)} ☁️`].filter(Boolean).join(" · ")];
   if (MODE_LABEL[applyMode(j)]) lines.push(MODE_LABEL[applyMode(j)]);
+  if (typeof years === "number" && years >= 1 && f.freshers_welcome) lines.push(`🎯 Lists ${years}+ yrs, but the post says skilled freshers are welcome: worth a try`);
   if (ft.why || f.reason) lines.push(`✅ ${esc(ft.why || f.reason).slice(0, 300)}`);
   return lines.join("\n");
+}
+
+// Links we hand out carry the job id (read back by the extension, which follows the tab through redirects).
+function fpTag(url, uid) {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol) || u.searchParams.has("fp_job") || !uid) return url;
+    u.searchParams.set("utm_source", "fresherpilot"); u.searchParams.set("utm_medium", "alert"); u.searchParams.set("fp_job", uid);
+    return u.toString();
+  } catch { return url; }
 }
 
 function buttons(uid, url, blogUrl, source, done) {
   const rows = [];
   if (/^https?:/.test(url || "")) {
-    const row = [{ text: source === "Telegram" ? "Apply ↗" : `Open on ${source || "site"} ↗`, url }];
+    const row = [{ text: source === "Telegram" ? "Apply ↗" : `Open on ${source || "site"} ↗`, url: fpTag(url, uid) }];
     if (/^https?:/.test(blogUrl || "") && blogUrl !== url) row.push({ text: "Post details ↗", url: blogUrl });
     rows.push(row);
   }
@@ -975,12 +1029,21 @@ async function onTelegram(env, update) {
   else if (text.startsWith("/resume") || text.startsWith("/start")) { await setState(env, "alerts_off", false); await say("🔔 Alerts are on."); }
   else if (text.startsWith("/status")) {  // where every job is right now (same as the dashboard's Pipeline tab)
     const p = await pipelineStatus(env);
-    const ago = (m) => (m === null ? "never" : m < 60 ? `${m} min ago` : `${Math.round(m / 60)} h ago`);
-    const lines = p.sources.map((x) => `${x.status === "ok" ? "✅" : "⚠️"} <b>${x.name}</b>: read ${ago(x.last_read_min)} ` +
-      `(every ~${x.every_min} min) · ${x.found_1h} new in 1 h, ${x.approved_24h} approved in 24 h` +
-      (x.note ? `\n    ${esc(x.note)}` : ""));
+    const ago = (m) => (m === null || m === undefined ? "never" : m < 1 ? "<1 min ago" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.floor(m / 60)} h ${m % 60} min ago` : `${Math.round(m / 1440)} days ago`);
+    const clock = (ms) => (ms ? new Date(ms + 5.5 * 3600e3).toISOString().slice(11, 16) : "--:--");  // IST hh:mm
+    const lines = p.sources.map((x) => `${x.status === "ok" ? "✅" : "⚠️"} <b>${x.name}</b>: checked ${ago(x.last_read_min)} (${clock(x.last_read_at)} IST, every ~${x.every_min} min)
+` +
+      `    newest new job: ${ago(x.last_new_min)} · ${x.found_1h} new in 1 h, ${x.found_24h} in 24 h, ${x.approved_24h} approved` +
+      (x.note ? `
+    ${esc(x.note)}` : ""));
     const st = p.stages;
-    await say(`📊 <b>Pipeline now</b>\n${lines.join("\n")}\n\n` +
+    // real 24 h outcome per job (not a timer): why jobs were not alerted
+    const why = (await env.DB.prepare(`SELECT CASE WHEN status='keep' THEN 'approved' ELSE COALESCE(category,'other') END AS c, COUNT(*) AS n
+      FROM jobs WHERE found_at > ? GROUP BY c ORDER BY n DESC LIMIT 8`).bind(now() - 24 * 3600e3).all()).results;
+    const total24 = p.sources.reduce((a, x) => a + x.found_24h, 0);
+    const whyTxt = why.map((r) => `${String(r.c).replace(/_/g, " ")} ${r.n}`).join(" · ");
+    await say(`📊 <b>Pipeline now</b> (${clock(p.now)} IST)\nA "checked" time only means the source was polled; the real results are below.\n${lines.join("\n")}\n\n` +
+      `<b>Last 24 h</b>: ${total24} jobs found → ${whyTxt}\n\n` +
       `<b>Last hour</b>: ${st.found_1h} new jobs → ${st.rule_rejected_1h} ruled out by rules (city / experience / title) → ` +
       `${st.ai_rejected_1h} rejected by the AI → ${st.approved_1h} approved → ${st.alerts_1h} alerts sent.\n` +
       `${st.waiting_ai ? "⏳" : "✅"} Waiting for the AI check: ${st.waiting_ai}` +
@@ -1049,7 +1112,7 @@ async function pipelineStatus(env) {
   const sources = rows.map(([name, reader, every, last]) => {
     const age = mins(last), e = srcErr[name];
     const late = age === null || age > every * 2.5;
-    return { name, reader, every_min: every, last_read_min: age, found_1h: (by[name] || {}).f1 || 0, found_24h: (by[name] || {}).f24 || 0,
+    return { name, reader, every_min: every, last_read_min: age, last_read_at: last || null, last_new_min: mins((by[name] || {}).last), found_1h: (by[name] || {}).f1 || 0, found_24h: (by[name] || {}).f24 || 0,
              approved_24h: (by[name] || {}).k24 || 0, status: late ? "late" : "ok",
              note: e && (!last || e.at > last) ? `last error ${mins(e.at)} min ago: ${e.error}` : "" };
   });
@@ -1128,6 +1191,10 @@ async function tick(env, only = null) {
   for (const j of kept) {
     if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
     if (j.posted_days != null && j.posted_days > CONFIG.posted_within_days) continue;
+    if (alertTooOld(j)) {  // stored and rated, but not worth a Telegram alert any more
+      await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
+      continue;
+    }
     if (await sendAlert(env, b, { uid: j.id, text: jobText(j), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
   }
   if (sent < MAX_ALERTS_PER_RUN && b.left > 6 && Math.floor(now() / 60000) % (tight ? 30 : 5) === 0) {
@@ -1135,7 +1202,7 @@ async function tick(env, only = null) {
       WHERE j.status = 'keep' AND a.uid IS NULL AND j.found_at > ? ORDER BY j.found_at DESC LIMIT 6`).bind(now() - DAY).all()).results;
     for (const j of missed) {
       if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
-      if (j.posted_days != null && j.posted_days > CONFIG.posted_within_days) {
+      if ((j.posted_days != null && j.posted_days > CONFIG.posted_within_days) || alertTooOld(j)) {
         await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
         continue;
       }

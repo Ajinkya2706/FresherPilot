@@ -90,6 +90,9 @@ _LI_SECONDS = POSTED_WITHIN_DAYS * 24 * 3600
 LINKEDIN_TITLES = [
     "AI Engineer", "Machine Learning Engineer", "Data Scientist",
     "Python Developer", "Backend Developer", "Software Engineer",
+    # Nov 11 2026: the owner saw matching openings on LinkedIn that none of the searches above surfaced
+    "Software Developer", "Forward Deployed Engineer", "ML Engineer", "Associate Software Engineer",
+    "Applied AI Engineer", "Generative AI Engineer",
 ]
 # Measured (Nov 2026, 24 h, India): the GenAI one finds ~120 jobs (56 pass the title rules), the
 # fresher one ~70 (42) with titles the plain searches miss ("Associate Data Scientist", "FDE", ...).
@@ -324,6 +327,12 @@ DEFAULT_PREFS = {
     # Jobs asking for exactly one year more than that ("1-3 yrs", "1+") as "stretch" jobs. Off: rejected
     # like other experienced jobs (freshers get far fewer calls from them).
     "stretch_jobs": False,
+    # Posts that list years ("3-5 yrs") but say skilled freshers / strong projects are welcome are kept (and tagged),
+    # not rejected by the free years rule. Posts for Senior/Lead titles stay rejected.
+    "skilled_freshers": True,
+    # Companies whose openings never reach you (scam / never reply). A name matches when all its words appear in
+    # the company name ("bajaj finance" blocks "Bajaj Finance Limited"). Dropped free, before any AI call.
+    "blocked_companies": ["Bajaj Finance", "Bajaj Finserv"],
     "roles": ROLES,                   # Naukri / Indeed searches
     "linkedin_titles": LINKEDIN_TITLES,
     # Extra LinkedIn-only searches (LinkedIn's OR / AND syntax), run like the titles in every city.

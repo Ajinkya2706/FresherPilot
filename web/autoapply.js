@@ -39,7 +39,7 @@ async function send(action, uid = null, btn = null) {
                                                       body: JSON.stringify(uid ? { action, uid } : { action }) });
     if (!r.ok) throw new Error((await r.json()).detail || r.status);
     toast({ applied: "Marked as applied ✅", skip: "Skipped ⏭", stop: "Stopping… (the open job ends within ~2 s)", pause: "Paused after this job ⏸",
-            resume: "Resumed ▶", continue: "Continuing this job ▶", open: "Opening its tab…" }[action] || "Done");
+            resume: "Resumed ▶", continue: uid ? "Queued: the bot picks this job up as soon as the job in progress finishes ▶" : "Continuing this job ▶", open: "Opening its tab…" }[action] || "Done");
   } catch (err) {
     toast(`Didn't work: ${err.message}`);
   }
@@ -61,7 +61,8 @@ function render() {
   const lastStart = s.log.map((e) => e.event).lastIndexOf("start");
   const emailed = s.log.slice(Math.max(0, lastStart)).filter((e) => e.event === "emailed").length;  // this run
   const silent = s.running && s.ext_seen_s !== null && s.ext_seen_s > 25;  // the extension stopped checking in
-  $("state").textContent = !s.running ? "Not running" : silent ? "⚠️ The extension isn't answering"
+  $("state").textContent = !s.running ? "Not running" : s.waiting_for_browser ? "⏳ Waiting for Chrome to pick up the run (up to 30 s)…"
+    : silent ? "⚠️ The extension isn't answering"
     : s.paused ? "⏸ Paused (set-aside jobs are still watched)" : "▶ Running in your browser";
   $("alert").hidden = !silent;
   if (silent) {
@@ -303,3 +304,26 @@ document.addEventListener("click", async (e) => {
 loadChooser();
 refresh();
 setInterval(refresh, 2000);
+
+
+// Is the extension in Chrome older than the files in this project? (Updating the files does not update Chrome's copy.)
+(async function checkExtensionVersion() {
+  const box = $("extWarn");
+  if (!box) return;
+  try {
+    const want = (await (await fetch("/api/extension/version")).json()).version;
+    const have = document.documentElement.dataset.jobfinderExtension || "";
+    if (!have) {
+      box.hidden = false;
+      box.innerHTML = "<b>The FresherPilot extension isn't active on this page.</b> Open <code>chrome://extensions</code>, make sure it is on, and refresh this page. Auto-apply needs it.";
+    } else if (want && have !== want) {
+      box.hidden = false;
+      box.innerHTML = `<b>The extension in Chrome is ${esc(have)}; the app has ${esc(want)}.</b> Open <code>chrome://extensions</code> and press the reload ↻ icon on FresherPilot, then refresh this page. `
+        + `<button class="btn" id="extReload">Try reloading it from here</button>`;
+      $("extReload").onclick = async () => {
+        try { await toExtension({ type: "jf-reload" }); box.innerHTML = "Reloading the extension… refresh this page in a few seconds."; }
+        catch (e) { box.innerHTML += " <span class='warn'>(this older version can't reload itself: use chrome://extensions)</span>"; }
+      };
+    }
+  } catch (_) { /* app restarting */ }
+})();

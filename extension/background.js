@@ -115,6 +115,45 @@ async function fillTab(tabId, overwrite) {
 const applyingTab = {}; // tabId -> job uid (so form answers use the right job)
 let running = false;
 
+// Job id carried by the links we hand out (Telegram buttons, the app's "Open on..." link, auto-apply tabs):
+//   ...?utm_source=fresherpilot&utm_medium=alert&fp_job=<uid>
+// The tab remembers it (tab id survives redirects, e.g. LinkedIn -> "Apply on company website" -> the ATS), a tab
+// opened from it inherits it, and the autofill sends it as the job id. Kept in session storage: the worker sleeps.
+const tabJob = {};  // tabId -> uid
+let tabJobLoaded = null;
+const loadTabJobs = () => (tabJobLoaded ||= chrome.storage.session.get("tabJob").then((r) => Object.assign(tabJob, r.tabJob || {})).catch(() => null));
+const saveTabJobs = () => chrome.storage.session.set({ tabJob }).catch(() => null);
+function fpJobIn(url) {
+  try { return new URL(url).searchParams.get("fp_job") || ""; } catch { return ""; }
+}
+function fpTag(url, uid) {  // the same tag the app and the Telegram buttons add
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol) || u.searchParams.has("fp_job") || !uid) return url;
+    u.searchParams.set("utm_source", "fresherpilot"); u.searchParams.set("utm_medium", "alert"); u.searchParams.set("fp_job", uid);
+    return u.toString();
+  } catch { return url; }
+}
+async function rememberTabJob(tabId, uid) {
+  await loadTabJobs();
+  if (tabJob[tabId] !== uid) { tabJob[tabId] = uid; saveTabJobs(); }
+}
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  const uid = fpJobIn(info.url || "");
+  if (uid) rememberTabJob(tabId, uid);
+});
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await loadTabJobs();
+  if (tabId in tabJob) { delete tabJob[tabId]; saveTabJobs(); }
+});
+
+// A popup or new tab opened by a job's tab (e.g. "Apply on company site") belongs to the same job.
+chrome.tabs.onCreated.addListener(async (tab) => {
+  await loadTabJobs();
+  const uid = (tab.openerTabId && (applyingTab[tab.openerTabId] || tabJob[tab.openerTabId])) || fpJobIn(tab.pendingUrl || tab.url || "");
+  if (uid) { applyingTab[tab.id] = uid; rememberTabJob(tab.id, uid); }
+});
+
 async function inTab(tabId, func, args = []) {
   const [res] = await chrome.scripting.executeScript({ target: { tabId }, func, args });
   return res?.result;
@@ -140,7 +179,7 @@ async function waitForLoad(tabId, timeout = 15000) {
 let RUN_ID = null;
 const report = (event, uid, detail = "", waiting = null) =>
   api("/api/autoapply/event", { method: "POST", body: JSON.stringify({ event, uid, detail, waiting, run: RUN_ID }) }).catch(() => null);
-const cmdUrl = (uid) => `/api/autoapply/command?run=${encodeURIComponent(RUN_ID || "")}${uid ? `&uid=${encodeURIComponent(uid)}` : ""}`;
+const cmdUrl = (uid, accept) => `/api/autoapply/command?run=${encodeURIComponent(RUN_ID || "")}${uid ? `&uid=${encodeURIComponent(uid)}` : ""}${accept ? `&accept=${accept}` : ""}`;  // accept: only take these commands, leave the rest for their own reader
 
 // Pause until the user clicks Continue / Skip / Stop in the app.
 const status = (tabId, text, waiting = false) =>
@@ -187,7 +226,7 @@ async function waitForUser(tabId, job, reason, kind) {
   let okStreak = 0;
   for (let i = 0; i < 900; i++) { // up to ~30 minutes
     await sleep(2000);
-    const { command } = await api(cmdUrl()).catch(() => ({ command: null }));
+    const { command } = await api(cmdUrl(null, "continue,skip,stop,applied")).catch(() => ({ command: null }));
     if (command) {
       if (command === "continue") await report("resumed", job.uid);
       return command;
@@ -268,7 +307,7 @@ async function applyWithLimit(job, settings, mode, resumeTabId = null) {
 
 async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
   let tabId = resumeTabId;
-  if (!tabId) tabId = (await chrome.tabs.create({ url: job.url, active: mode === "single" })).id;
+  if (!tabId) tabId = (await chrome.tabs.create({ url: fpTag(job.url, job.uid), active: mode === "single" || ["Indeed", "Internshala", "Wellfound"].includes(job.source) })).id;
   const opened = [tabId];
   applyingTab[tabId] = job.uid;
   let parked = false;
@@ -331,7 +370,7 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
       }
       if (decision.action === "skip") {
         // The site says you've applied before: that counts as applied, not skipped.
-        if (/already (?:been )?(applied|submitted)|you('ve| have) (already )?applied|application (was |has been )?(already )?(sent|submitted) (earlier|before|\d)/i.test(decision.reason || "")) {
+        if (/^already applied to this job earlier/i.test(decision.reason || "")) {  // only the server's page-text rule (an AI guess is not proof)
           return { event: "applied", detail: "already applied earlier" };
         }
         // "No apply button" is often content that appears only after scrolling: look once more.
@@ -424,7 +463,7 @@ async function parkedResolved(tabId, kind) {
 // run commands (stop / pause / resume / skip = skip the current job / applied = you applied the current job) and
 // per set-aside job (open / continue / skip / applied).
 async function pollControl(parked) {
-  const { command } = await api(cmdUrl()).catch(() => ({ command: null }));
+  const { command } = await api(cmdUrl(null, "stop,pause,resume,skip,applied")).catch(() => ({ command: null }));
   if (command === "stop") {
     ctl.stop = true;
     ctl.current?.end({ byYou: true, event: "skipped", detail: "run stopped by you" });
@@ -486,6 +525,20 @@ async function finish(parked, job, result) {
   }
 }
 
+// The extension PULLS a run the app has started (consumer model): the page no longer has to be open. The app keeps
+// the started run as "pending"; this asks for it every ~30 s (an alarm wakes the worker) and starts it once.
+const PENDING_ALARM = "jf-autoapply-pending";
+async function pullPendingRun() {
+  if (running) return;
+  const r = await api("/api/autoapply/pending").catch(() => null);
+  if (r && r.start && !running) await runQueue(r.start);
+}
+function ensurePendingAlarm() { chrome.alarms.create(PENDING_ALARM, { periodInMinutes: 0.5 }); }
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === PENDING_ALARM) pullPendingRun().catch(() => {}); });
+chrome.runtime.onInstalled.addListener(ensurePendingAlarm);
+chrome.runtime.onStartup.addListener(ensurePendingAlarm);
+ensurePendingAlarm();
+
 async function runQueue(start) {
   if (running) {
     // A new Start replaces the run still going here (e.g. from before the app restarted): end it, then start.
@@ -527,7 +580,7 @@ async function runQueue(start) {
         await finish(parked, job, result);
         if (result.stop) ctl.stop = true;
         if (mode === "single") {
-          const { command } = await api(cmdUrl()).catch(() => ({ command: null }));
+          const { command } = await api(cmdUrl(null, "stop")).catch(() => ({ command: null }));
           if (command === "stop") ctl.stop = true;
         }
         if (parked.size && !ctl.stop) await serviceParked(parked, settings, mode);  // anything you finished meanwhile
@@ -756,7 +809,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg.type) {
       case "jf-autofill": {
-        const uid = sender.tab ? applyingTab[sender.tab.id] : undefined;
+        // Which job is this tab for? Its own mapping, else the tab it was opened from, else the job being applied now.
+        await loadTabJobs();
+        let uid = sender.tab ? (applyingTab[sender.tab.id] || tabJob[sender.tab.id] || fpJobIn(sender.tab.url)) : undefined;
+        if (!uid && sender.tab?.openerTabId) uid = applyingTab[sender.tab.openerTabId] || tabJob[sender.tab.openerTabId];
+        if (uid && sender.tab) { applyingTab[sender.tab.id] = uid; rememberTabJob(sender.tab.id, uid); }
         return api("/api/autofill", { method: "POST", body: JSON.stringify({ ...msg.payload, uid: uid || "" }) });
       }
       case "jf-resume":
@@ -771,6 +828,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return { server: await serverUrl() };
       case "jf-autoapply-start": // from the app page (via bridge.js)
         return runQueue(msg.start);
+      case "jf-reload": // from the app page: reload this extension (after an update of the files)
+        setTimeout(() => chrome.runtime.reload(), 300);
+        return { ok: true };
       case "jf-set-token": // from the app page: the signed-in user's token
         await chrome.storage.local.set({ token: msg.token });
         return { ok: true };

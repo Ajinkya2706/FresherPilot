@@ -140,9 +140,11 @@ def _new_state(start_checker: Callable[[], Any], start_fetch: Callable[[], Any])
                            "check": start_checker, "fetch": start_fetch}
 
 
-def run_once(start_checker: Callable[[], Any], start_fetch: Callable[[], Any]) -> bool:
+def run_once(start_checker: Callable[[], Any], start_fetch: Callable[[], Any], hours: float | None = None) -> bool:
     """Manual mode, the Fetch button: every board once and one LinkedIn round (last MANUAL_LI_HOURS), saving
-    jobs as they come; then the readers stop. False = a manual fetch is already running."""
+    jobs as they come; then the readers stop. False = a manual fetch is already running.
+    hours = look back this far (1, 3, 24..., CATCHUP_DAYS*24 = "all time"); None = latest (since each board's last
+    read). Jobs already in the list are never opened again, whatever the window."""
     uid = users.current() or ""
     with _lock:
         old = _state.get(uid)
@@ -160,7 +162,8 @@ def run_once(start_checker: Callable[[], Any], start_fetch: Callable[[], Any]) -
         last = s["read_at"].get(board)
         _note(s, board, busy=True)
         try:
-            _add(s, board, _SLOW[board](s, None if last is None else (now - last) / 3600))
+            back = hours if hours else (None if last is None else (now - last) / 3600)
+            _add(s, board, _SLOW[board](s, back))
             s["read_at"][board] = now
             _note(s, board, busy=False, ok_at=now)
         except Exception as exc:  # noqa: BLE001
@@ -171,13 +174,14 @@ def run_once(start_checker: Callable[[], Any], start_fetch: Callable[[], Any]) -
 
         threads = [users.thread(one_board, b) for b in _SLOW_BOARDS if b in cfg.LIVE_BOARDS]
         keep = lambda t: llm_filter.title_excluded(t) is None  # noqa: E731
-        window = int(cfg.MANUAL_LI_HOURS * 3600)
+        window = int((hours or cfg.MANUAL_LI_HOURS) * 3600)
+        wide = bool(hours) and hours > 3  # a long look-back: walk more pages, don't stop at the first known page
         for search in searches:
             _note(s, "linkedin", busy=True, searches=len(searches), last_search=f"{search[0]} @ {search[1]}")
             try:
                 res = free_boards.linkedin([search], window / 3600, _known(s, "LinkedIn"), keep, minutes=5, seconds=window,
-                                           stop_on_known=True, max_pages=5,
-                                           on_batch=lambda jobs: _add(s, "linkedin", _within(jobs, window / 60)))
+                                           stop_on_known=not wide, max_pages=40 if wide else 5,
+                                           on_batch=lambda jobs: _add(s, "linkedin", jobs if wide else _within(jobs, window / 60)))
                 if res["blocked"]:
                     _note(s, "linkedin", busy=False, error=res["blocked"])
                     break

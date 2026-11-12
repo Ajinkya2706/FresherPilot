@@ -45,7 +45,11 @@ def source_of(url: str) -> tuple[str, str]:
 
 
 def _norm_url(url: str) -> str:
-    return re.sub(r"[?#].*$", "", url.strip()).rstrip("/").lower()
+    # The query is dropped (tracking params) except the job id of id-in-the-query links: every Indeed
+    # "viewjob?jk=..." link is the same page without it, so one job matched them all (Nov 12 test applied to the wrong job).
+    keep = re.search(r"[?&](jk|vjk|currentJobId)=([\w-]+)", url)
+    base = re.sub(r"[?#].*$", "", url.strip()).rstrip("/").lower()
+    return f"{base}?{keep.group(1)}={keep.group(2).lower()}" if keep else base
 
 
 def find(url: str, jobs: list[dict[str, Any]]) -> dict[str, Any] | None:

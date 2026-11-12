@@ -5,13 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FresherPilot · Settings</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/ui.css" />
+    <script src="/static/ui.js"></script>
     <link rel="stylesheet" href="/static/account.css" />
   </head>
   <body>
+    <div id="appnav" data-active="settings"></div>
     <main class="setup">
-      <header class="brand"><span class="logo" aria-hidden="true">JF</span>
-        <div><h1>Settings</h1><p class="tagline" id="who"></p></div>
-        <div class="row" style="margin-left:auto"><a class="btn" href="/">← Back to jobs</a><button class="btn" id="logout">Log out</button></div></header>
+      <header class="row" style="justify-content:space-between;align-items:center;margin:8px 0 16px">
+        <div><h1 style="margin:0">Settings</h1><p class="muted small" id="who" style="margin:2px 0 0;display:block"></p></div>
+        <button class="btn" id="logout">Log out</button></header>
 
       <section class="panel">
         <h2>API keys</h2>
@@ -48,6 +51,9 @@
           <label class="field">Years of full-time experience<input id="experience_years" type="number" min="0" step="0.5" /></label>
           <label class="field">Hide jobs asking for this many years or more<input id="reject_from_years" type="number" min="1" step="1" /></label>
         </div>
+        <label for="blocked_companies" style="display:block;margin:8px 0 4px">Blocked companies (one per line): their jobs never reach you, never get auto-applied</label>
+        <textarea id="blocked_companies" rows="3" placeholder="Bajaj Finance"></textarea>
+        <label class="check" style="display:flex;gap:8px;align-items:center;margin:4px 0 10px"><input type="checkbox" id="skilled_freshers" /> Keep jobs that list years (e.g. "3-5 yrs") but say skilled freshers / strong projects are welcome (marked in the list)</label>
         <label class="check" style="display:flex;gap:8px;align-items:center;margin:4px 0 10px"><input type="checkbox" id="stretch_jobs" /> Also show jobs asking for one year more (e.g. "1-3 yrs") as "stretch" jobs</label>
         <label class="field">Job titles to search<textarea id="roles" rows="2"></textarea></label>
         <label class="field">LinkedIn searches: job titles (up to 10; also used for Wellfound)<input id="linkedin_titles" /></label>
@@ -115,6 +121,9 @@
         for (const k of ["headline", "summary", "target_area", "experience_years", "reject_from_years"]) $(k).value = s[k] ?? "";
         for (const k of LISTS) $(k).value = (s[k] || []).map((x) => x.trim()).join(", ");
         $("stretch_jobs").checked = !!s.stretch_jobs;
+        $("skilled_freshers").checked = s.skilled_freshers !== false;
+        $("blocked_companies").value = (s.blocked_companies || []).join("
+");
         $("linkedin_queries").value = (s.linkedin_queries || []).join("\n");
         setupAccount(me);
         loadTelegram();
@@ -233,6 +242,9 @@
         prefs.experience_years = Number($("experience_years").value || 0);
         prefs.reject_from_years = Math.max(1, Number($("reject_from_years").value || 1));
         prefs.stretch_jobs = $("stretch_jobs").checked;
+        prefs.skilled_freshers = $("skilled_freshers").checked;
+        prefs.blocked_companies = $("blocked_companies").value.split("
+").map((x) => x.trim()).filter(Boolean);
         for (const k of LISTS) prefs[k] = $(k).value.split(",").map((x) => x.trim()).filter(Boolean);
         prefs.linkedin_titles = prefs.linkedin_titles.slice(0, 10);
         prefs.linkedin_queries = $("linkedin_queries").value.split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 6);

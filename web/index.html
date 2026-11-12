@@ -5,28 +5,44 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FresherPilot</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/ui.css" />
+    <script src="/static/ui.js"></script>
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">
-        <span class="logo" aria-hidden="true">JF</span>
-        <div>
-          <h1>FresherPilot</h1>
-          <p class="tagline" id="tagline">Fresher jobs matched to your resume</p>
-        </div>
-      </div>
+      <a class="brand" href="/"><span class="logo" aria-hidden="true">JF</span>
+        <div><span class="brand-name">FresherPilot</span><p class="tagline" id="tagline">Fresher jobs matched to your resume</p></div></a>
       <nav class="tabs" aria-label="Views">
         <button type="button" class="tab" data-view="dashboard">Dashboard</button>
         <button type="button" class="tab" data-view="jobs">Jobs <span id="tabNew" class="tab-badge" hidden></span></button>
+        <a class="tab" href="/autoapply" title="Auto-apply: progress, jobs waiting for you, controls">Auto-apply</a>
       </nav>
       <div class="fetch">
-        <a class="btn ghost" href="/static/profile.html">Profile</a>
-        <a class="btn ghost" href="/account" id="userBtn" title="Settings: keys, search, password">Settings</a>
-        <button id="missedBtn" type="button" class="btn ghost" title="Paste a job link you found elsewhere: the app checks it had it, adds it if not, and logs the miss">Missed a job?</button>
-        <a class="btn" href="/autoapply" title="Auto-apply dashboard: progress, jobs waiting for you, controls">Auto-apply ↗</a>
+        <select id="fetchRange" class="btn" title="How far back to look. Jobs you already have are never fetched again." aria-label="Fetch range">
+          <option value="latest">Latest (since last fetch)</option>
+          <option value="1">Past 1 hour</option>
+          <option value="3">Past 3 hours</option>
+          <option value="24">Past 24 hours</option>
+          <option value="all">All time (7 days)</option>
+        </select>
         <button id="fetchBtn" type="button" class="btn primary">Fetch new jobs</button>
+        <details class="menu"><summary class="btn ghost" aria-label="More">More ▾</summary>
+          <div class="menu-panel">
+            <a href="/static/profile.html">Profile</a>
+            <a href="/account" id="userBtn" title="Settings: keys, search, password">Settings</a>
+            <button id="missedBtn" type="button" title="Paste a job link you found elsewhere: the app checks it had it, adds it if not, and logs the miss">Missed a job?</button>
+          </div>
+        </details>
       </div>
     </header>
+
+    <section id="pipeline" class="pipeline" aria-label="Pipeline: reading, AI rating, auto-apply (independent stages)">
+      <div class="stage" id="stRead"><h3>1 · Reading boards</h3><p class="big" id="stReadBig">…</p><p class="sub" id="stReadSub"></p></div>
+      <span class="arrow" aria-hidden="true">→</span>
+      <div class="stage" id="stRate"><h3>2 · AI rating</h3><p class="big" id="stRateBig">…</p><p class="sub" id="stRateSub"></p></div>
+      <span class="arrow" aria-hidden="true">→</span>
+      <div class="stage" id="stApply"><h3>3 · Auto-apply</h3><p class="big" id="stApplyBig">…</p><p class="sub" id="stApplySub"></p></div>
+    </section>
 
     <div class="statusbar">
       <p id="status" class="status">Loading…</p>
@@ -59,7 +75,7 @@
 
     <!-- ============================================================ dashboard -->
     <section id="dashboardView" class="view" hidden>
-      <div id="dash" class="dash"><p class="muted loading">Loading your dashboard…</p></div>
+      <div id="dash" class="dash"><div class="sk-grid"><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div></div><p class="muted loading" style="padding:0 20px">Loading your dashboard…</p></div>
     </section>
 
     <!-- ============================================================ jobs -->
@@ -93,7 +109,7 @@
       <main class="split" id="split">
         <aside class="list-pane">
           <p id="resultCount" class="muted count"></p>
-          <ul id="list" class="job-list"></ul>
+          <ul id="list" class="job-list"><li class="sk-card"><div class="sk sk-line w80"></div><div class="sk sk-line w60"></div><div class="sk-row"><div class="sk sk-chip"></div><div class="sk sk-chip"></div></div></li><li class="sk-card"><div class="sk sk-line w80"></div><div class="sk sk-line w40"></div><div class="sk-row"><div class="sk sk-chip"></div><div class="sk sk-chip"></div></div></li><li class="sk-card"><div class="sk sk-line w60"></div><div class="sk sk-line w80"></div><div class="sk-row"><div class="sk sk-chip"></div></div></li></ul>
         </aside>
         <section class="detail-pane" id="detail" aria-live="polite">
           <div class="placeholder">

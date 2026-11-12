@@ -31,7 +31,7 @@
     new PerformanceObserver(() => (lastRequest = performance.now())).observe({ type: "resource", buffered: false });
   } catch {}
 
-  const BUSY_TEXT = /^(loading|please wait|just a moment|submitting|processing|uploading)\b|checking your browser|loading\.\.\.|loading…/i;
+  const BUSY_TEXT = /^(loading|please wait|just a moment|submitting|processing|uploading)\b|checking your browser|loading\.\.\.|loading…|preparing (your |the )?review|preparing your application/i;
 
   // Why the page is still busy, or "" when it looks ready.
   function busyReason() {
@@ -56,7 +56,7 @@
       .find((e) => visible(e) && e.getBoundingClientRect().width < innerWidth * 0.9 && animating(e));
     if (spinner) return "spinner";
     const dialog = currentDialog();
-    const text = clean((dialog || document.body).innerText).slice(0, 300);
+    const text = clean((dialog || document.body).innerText).slice(0, 400);
     if (BUSY_TEXT.test(text)) return "loading text";
     return "";
   }
@@ -90,14 +90,19 @@
   // ---------------------------------------------------------------- hints
 
   function currentDialog() {
-    const dialogs = [...document.querySelectorAll("[role=dialog],[aria-modal=true],.artdeco-modal,[class*=modal],[class*=Drawer]")].filter(visible);
+    // A real dialog element first (LinkedIn's Easy Apply is a <dialog>): a looser "modal"-named element inside it
+    // must not be taken for the dialog, or the footer's Next / Submit buttons count as outside it.
+    // (an empty wrapper, e.g. Wellfound's, is skipped: the form lives in a sibling modal found below)
+    const real = [...document.querySelectorAll("dialog[open],[role=dialog],[aria-modal=true],[data-testid=dialog]")].filter((e) => visible(e) && clean(e.innerText).length > 0);
+    if (real.length) return real[real.length - 1];
+    const dialogs = [...document.querySelectorAll(".artdeco-modal,[class*=modal],[class*=Drawer]")].filter(visible);
     return dialogs[dialogs.length - 1] || null;
   }
 
   function snapshot() {
     document.querySelectorAll(".__jfhint").forEach((n) => n.remove());
     document.querySelectorAll("[data-jf-hint]").forEach((n) => n.removeAttribute("data-jf-hint"));
-    const sel = "a[href],button,[role=button],[role=link],input[type=submit],input[type=button],[role=menuitem],[role=tab],[role=radio],[role=option],summary";
+    const sel = "a[href],button,[role=button],[role=link],input[type=submit],input[type=button],[role=menuitem],[role=tab],[role=radio],[role=option],summary,label.ssrc__label,div.sendMsg";
     const all = [...document.querySelectorAll(sel)].filter((e) => rendered(e) && !e.closest("#__jf_status"));
     const dialog = currentDialog();
     // Real buttons (Next / Submit...) first, then links; dialog contents before the rest of the page.
@@ -127,8 +132,14 @@
     const root = dialog || document.body;
     const fields = [...root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]),select,textarea")].filter((f) => rendered(f) && !f.closest("#__jf_status"));
     const empty = fields.filter((f) => (f.type === "radio" || f.type === "checkbox" ? false : !clean(f.value))).length;
+    // "Applied" shown as a plain span/div (Naukri, LinkedIn "Applied 2d ago"), not a button the list above would hold.
+    const already = !dialog && [...document.querySelectorAll("button,div,span,a,p")].some((e) => {
+      if (e.childElementCount > 1 || e.closest("#__jf_status, nav, aside, header, footer, [role=navigation], a[href]")) return false;  // a nav link "Applied" is not this job's state
+      const t = clean(e.innerText);
+      return t.length > 0 && t.length < 24 && /^(?:✓\s*)?(?:already\s+)?applied(?:\s*✓)?(?:\s+\d+\s*\w+\s+ago)?$/i.test(t) && e.getBoundingClientRect().width > 2 && e.getBoundingClientRect().height > 2 && e.getBoundingClientRect().top < innerHeight * 1.2;  // a DISABLED "Applied" button counts too
+    });
     return {
-      url: location.href, title: document.title, items, dialog: !!dialog, fields: fields.length, empty_fields: empty,
+      already, url: location.href, title: document.title, items, dialog: !!dialog, fields: fields.length, empty_fields: empty,
       blocked: blockedState(), text: clean(root.innerText).slice(0, 2500), full_text: clean(document.body.innerText).slice(0, 8000),
     };
   }
@@ -176,18 +187,39 @@
       document.documentElement.appendChild(host);
     }
     const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const accent = waiting ? "#f59e0b" : "#34d399";
+    const min = host.dataset.min === "1";
     host.shadowRoot.innerHTML = `
       <style>
-        .box{font:13px/1.4 system-ui,"Segoe UI",sans-serif;background:#15202b;color:#fff;border-radius:12px;padding:10px 12px;
-             box-shadow:0 8px 28px rgba(0,0,0,.3);max-width:320px;display:grid;gap:8px;border-left:4px solid ${waiting ? "#f59e0b" : "#22c55e"}}
-        b{font-weight:700}.row{display:flex;gap:6px;flex-wrap:wrap}
-        button{font:inherit;font-weight:600;border:0;border-radius:999px;padding:5px 12px;cursor:pointer;background:#334155;color:#fff}
-        button.go{background:#16a34a}
+        *{box-sizing:border-box}
+        .box{font:13px/1.45 "Segoe UI",system-ui,sans-serif;background:#0f1720;color:#e8eef5;border:1px solid #243042;border-radius:14px;
+             width:${min ? "auto" : "304px"};box-shadow:0 12px 36px rgba(0,0,0,.45);overflow:hidden}
+        .hd{display:flex;align-items:center;gap:8px;padding:9px 10px 9px 12px;border-bottom:${min ? "0" : "1px solid #1c2735"}}
+        .logo{width:22px;height:22px;border-radius:6px;background:#34d399;color:#052419;font:800 10px/22px "Segoe UI",sans-serif;text-align:center}
+        .name{font-weight:700;letter-spacing:-.01em}
+        .dot{width:8px;height:8px;border-radius:50%;background:${accent};box-shadow:0 0 0 0 ${accent};animation:p 1.6s infinite}
+        @keyframes p{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+        .sp{flex:1}
+        .min{border:0;background:none;color:#93a3b6;cursor:pointer;font:700 16px/1 inherit;padding:2px 6px;border-radius:6px}
+        .min:hover{background:#1c2735;color:#fff}
+        .bd{padding:10px 12px 12px;display:${min ? "none" : "grid"};gap:10px}
+        .msg{color:#c2ccd8;word-break:break-word}
+        .row{display:flex;gap:6px;flex-wrap:wrap}
+        button.a{font:inherit;font-weight:600;border:1px solid #34414f;border-radius:999px;padding:6px 14px;cursor:pointer;background:#17212d;color:#e8eef5}
+        button.a:hover{border-color:#93a3b6}
+        button.go{background:#34d399;border-color:#34d399;color:#052419}
+        button.stop{color:#ff8a80;border-color:#5a2a2b;background:transparent}
+        button:focus-visible{outline:2px solid #34d399;outline-offset:2px}
       </style>
-      <div class="box"><div><b>FresherPilot</b> · ${esc(text)}</div>
-        <div class="row">${waiting ? '<button class="go" data-a="continue">Continue</button><button data-a="skip">Skip job</button>' : ""}<button data-a="stop">Stop</button></div></div>`;
+      <div class="box" role="status" aria-live="polite">
+        <div class="hd"><span class="logo">JF</span><span class="name">FresherPilot</span><span class="dot"></span><span class="sp"></span>
+          <button class="min" data-a="min" aria-label="${min ? "Expand" : "Minimize"}">${min ? "+" : "-"}</button></div>
+        <div class="bd"><div class="msg">${esc(text)}</div>
+          <div class="row">${waiting ? '<button class="a go" data-a="continue">Continue</button><button class="a" data-a="skip">Skip job</button>' : ""}<button class="a stop" data-a="stop">Stop</button></div></div>
+      </div>`;
     host.shadowRoot.querySelectorAll("button").forEach((b) =>
       b.addEventListener("click", () => {
+        if (b.dataset.a === "min") { host.dataset.min = host.dataset.min === "1" ? "0" : "1"; showStatus(text, waiting); return; }
         chrome.runtime.sendMessage({ type: "jf-command", action: b.dataset.a });
         showStatus(b.dataset.a === "continue" ? "Continuing…" : b.dataset.a === "skip" ? "Skipping this job…" : "Stopping…", false);
       })

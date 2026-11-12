@@ -70,7 +70,7 @@ yrs: minimum years of experience REQUIRED (number) or null if never stated.
  Several: the main/overall one ("5+ overall, 2+ in ML"->5).
  Degree-dependent: the candidate has ONLY a bachelor's (B.E.), so use the bachelor's requirement, never the MS/PhD one ("BS and 5-8 years / MS and 3-6 / PhD and 0-3" -> 5).
  Ignore company age, "preferred/nice to have", "up to N years". Naukri field often starts at 0 by default; a higher JD minimum wins.
-fresh: true only if it explicitly says freshers/new grads/0 years can apply.
+fresh: true if the post says freshers / new grads / 0 years / no experience needed / entry-level can apply, in ANY wording, OR says skills, projects, portfolio or internships can replace the listed experience (even when it lists e.g. 3-5 years). false if it says freshers need not apply or never mentions it.
 sen (title/level words ONLY, never from years): entry|mid|senior|lead|unclear
  mid = II/III/SDE-2/L3/"experienced". senior = senior/sr/staff/principal/architect. lead = lead/manager/head/director/VP/AVP/CTO.
  Associate/Junior/Graduate/Trainee/Engineer I/SDE-1 = entry. No level words = unclear.
@@ -81,7 +81,7 @@ role (by actual duties, not keywords): dev|aiml|devops|qa_auto|qa_manual|support
  sales = sales/pre-sales/BD/marketing. non_sw = electrical/mechanical/civil/hardware/RF/CAD/field service.
  other = HR/finance/content/data entry/annotation/operations/product or project mgmt/non-coding analysts.
  A developer job at a BPO/sales company is still dev.
-ev: short exact quote that gave yrs ("" if none). why: what the role is, max 12 words, no fit judgement."""
+ev: short exact quote that gave yrs; when fresh is true and yrs>=1, the quote that welcomes freshers instead ("" if none). why: what the role is, max 12 words, no fit judgement."""
 
 _EMP = {"ft": "full_time", "intern": "internship", "intern_ft": "internship_then_full_time", "contract": "contract",
         "part": "part_time", "freelance": "freelance", "unclear": "unclear"}
@@ -163,11 +163,33 @@ def _stretch_on() -> bool:
     return bool(users.prefs().get("stretch_jobs"))
 
 
+
+# ---------------------------------------------------------------- "3-5 years listed, but freshers / skilled people welcome"
+# The AI decides (facts: fresh = freshers / 0 years / skills, projects or internships can replace the listed years, in ANY
+# wording: a keyword list always misses a rewording such as "0 experience allowed"). So a post that lists years is not
+# rejected for free any more: the AI reads it, unless its title says Senior/Lead/... or the setting is off. Cost: about
+# 40 such posts a day (812 of 12.7k saved jobs over three weeks), a few thousand tokens.
+
+def _skilled_on() -> bool:
+    from fresherpilot.core import users
+
+    return users.prefs().get("skilled_freshers", True) is not False
+
+
+def ai_reads_years_posts(job: dict[str, Any]) -> bool:
+    """True = do not reject this post just because the board lists years: let the AI read the description."""
+    if not _skilled_on():
+        return False
+    if re.search(r"\b(?:senior|sr|lead|principal|staff|head|director|manager|architect)\b", str(job.get("title") or ""), re.I):
+        return False
+    return len(str(job.get("description") or "")) >= 80  # nothing to read = the label decides
+
+
 def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
     """Apply the candidate's preferences to the extracted facts -> (decision, category)."""
     if facts.get("prescreen"):  # rejected before the full check (board data or title screen)
         return "reject", facts.get("category") or "other"
-    freshers = bool(facts.get("freshers_welcome"))
+    freshers = bool(facts.get("freshers_welcome"))  # the AI's reading of the whole post ("3-5 yrs but freshers welcome" included)
     years = facts.get("min_years_required")
     level = str(job.get("experience") or "")
     platform_min = re.match(r"\s*(\d+)\s*-\s*\d+\s*years", level)
@@ -179,7 +201,11 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
     reject_from = _reject_from_years()
     low_years = isinstance(years, (int, float)) and years < reject_from
     # "mid" is a soft label; a stated requirement of <=1 year or "freshers welcome" outranks it.
-    if facts.get("seniority") not in ALLOWED_SENIORITY and not (facts.get("seniority") == "mid" and (freshers or low_years)):
+    # A "mid"/"senior" label with NO years and NO quoted evidence is the model's guess from a short post
+    # (Nov 11: Scoutit "AI Engineer" / "Software Engineer" rejected that way): let it through to the skill-fit check.
+    guess = (facts.get("seniority") in ("mid", "senior") and years is None and not str(facts.get("experience_evidence") or "").strip()
+             and not re.search(r"senior|lead|principal|staff|manager|head|architect|\b(?:ii|iii|iv|2|3|4)\s*$", str(job.get("title") or ""), re.I))
+    if facts.get("seniority") not in ALLOWED_SENIORITY and not guess and not (facts.get("seniority") == "mid" and (freshers or low_years)):
         return "reject", "too_senior"
     if re.search(r"director|executive", level, re.I):  # LinkedIn's own level field
         return "reject", "too_senior"
@@ -784,7 +810,23 @@ def title_excluded(title: str) -> tuple[str, str] | None:
     return None
 
 
+def blocked_company(company: str) -> str:
+    """The blocklist entry that matches this company name ("" = none). Word match, so "bajaj finance" blocks
+    "Bajaj Finance Ltd" but not "Bajaj Auto"."""
+    from fresherpilot.core import users
+
+    have = set(re.findall(r"[a-z0-9]+", str(company or "").lower()))
+    for entry in users.prefs().get("blocked_companies") or []:
+        words = re.findall(r"[a-z0-9]+", str(entry).lower())
+        if words and all(w in have for w in words):
+            return str(entry)
+    return ""
+
+
 def _board_reject(job: dict[str, Any]) -> tuple[str, str] | None:
+    hit = blocked_company(job.get("company", ""))
+    if hit:
+        return "blocked_company", f"Blocked company: {hit}"
     words = title_excluded(job.get("title", ""))
     if words:
         return words[0], f'Title contains "{words[1]}"'
@@ -805,8 +847,21 @@ def _board_reject(job: dict[str, Any]) -> tuple[str, str] | None:
     # One year over the limit ("1-3 years") is a stretch job judged by the AI when stretch jobs are on;
     # otherwise (and for more years) it is rejected free.
     if m and float(m.group(1)) >= _reject_from_years() + (1 if _stretch_on() else 0):
+        if ai_reads_years_posts(job):  # the AI reads the post: "3-5 yrs" may still welcome freshers with skills
+            return None
         return "needs_experience", f"{job.get('source')} lists {level}"
     return None
+
+
+def reopen_stale_board_rejects(jobs: list[dict[str, Any]]) -> int:
+    """Jobs rejected for free from board data (e.g. "3-5 years") under a rule that no longer rejects them (the fresher
+    hint gate, a changed years limit...) lose that verdict, so the AI reads them. prescreen() only looked at jobs
+    that were still unchecked, so these stale rejects were never re-opened. Returns how many were re-opened."""
+    cache = _load_cache()
+    stale = [job_key(j) for j in jobs if (cache.get(job_key(j)) or {}).get("prescreen") == "board" and not _board_reject(j)]
+    if stale:
+        _update_cache(remove=stale)
+    return len(stale)
 
 
 def prescreen(jobs: list[dict[str, Any]]) -> int:
@@ -887,7 +942,7 @@ def judge_jobs(
 # it is a valid fresher developer role.
 
 FIT_VERSION = os.getenv("JF_FIT_VERSION") or "fit-v2"
-ALLOWED_FIT = {"strong", "partial"}
+ALLOWED_FIT = {"strong", "partial", "none"}  # Nov 12: a stack the owner does not know is no reason to reject a developer role
 FIT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -931,7 +986,8 @@ why: max 12 words, main stack + why."""
 
 _OWNER_FIT_RULES = """fit: strong = AI/ML/GenAI/LLM/NLP/CV engineering, data science, or Python backend/API.
  partial = software/backend/data/DevOps/cloud where Python, SQL/data, ML or AWS/Docker is a REAL part of the work, or no stack is fixed (generic SDE, "any language", trainee programs). Python as one accepted option = partial.
- none = main stack is one the candidate doesn't use: Java/Spring, .NET/C#, PHP, Go, Ruby, JS-only frontend (React/Angular/Vue/TypeScript/Next.js), Node/MERN-only, mobile (Android/iOS/Flutter/React Native), embedded C/C++, game dev, Salesforce/SAP/Zoho/ServiceNow, RPA, Power BI/Tableau-only, SAS/R, manual testing. Generic titles ("Associate Software Engineer", "Full Stack Developer") with such a stack are none."""
+ none = main stack is one the candidate doesn't use: Java/Spring, .NET/C#, PHP, Go, Ruby, JS-only frontend (React/Angular/Vue/TypeScript/Next.js), Node/MERN-only, mobile (Android/iOS/Flutter/React Native), embedded C/C++, game dev, Salesforce/SAP/Zoho/ServiceNow, RPA, Power BI/Tableau-only, SAS/R, manual testing. Generic titles ("Associate Software Engineer", "Full Stack Developer") with such a stack are none.
+ EXCEPTION: a job whose title or main work is AI / ML / GenAI / LLM / agents ("AI Engineer", "Forward Deployed Engineer" building AI) is partial at least, even if the app code is TypeScript/Node/Java: the AI work is the job. none only when "AI" is just a buzzword."""
 
 
 def _fit_rules(p: dict[str, Any]) -> str:

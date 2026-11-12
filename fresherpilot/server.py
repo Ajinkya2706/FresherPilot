@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import faulthandler
 import os
+import re
 import threading
 import time
 import traceback
@@ -33,7 +34,17 @@ faulthandler.enable(open(ROOT / "crash.log", "a", encoding="utf-8"), all_threads
 STATIC = ROOT / "web"
 
 app = FastAPI(title="FresherPilot")
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
+class _FreshStatic(StaticFiles):
+    """Static files with Cache-Control: no-cache: the browser asks every time (a cheap 304 when unchanged) instead of
+    showing a stale page/stylesheet after an update (Nov 6 2026: new HTML with the old CSS looked broken)."""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", _FreshStatic(directory=STATIC), name="static")
 # The autofill browser extension calls this local API from its background worker.
 app.add_middleware(
     CORSMiddleware,
@@ -185,6 +196,9 @@ def _run_checker() -> None:
     errors: dict[str, str] = {}
     checked = 0
     try:
+        reopened = llm_filter.reopen_stale_board_rejects(_normalized_jobs(load_cache()))
+        if reopened:
+            print(f"[ai check] {reopened} job(s) rejected for free under an older rule are re-opened for the AI", flush=True)
         while True:
             while autoapply.STATE.get("running"):  # auto-apply gets the AI quota first
                 _T()["check"].update(stage="paused_for_autoapply")
@@ -307,7 +321,7 @@ def _collapse_duplicates(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [job for i, job in enumerate(jobs) if i not in hidden]
 
 
-def _pack(payload: dict | None) -> dict[str, Any]:
+def _pack(payload: dict | None, slim: bool = False) -> dict[str, Any]:
     jobs = _normalized_jobs(payload)
     seen = visited.backfill(jobs, visited.load_all())  # once: old visited jobs also match their reposts
     apps = applicant.applications()
@@ -330,11 +344,25 @@ def _pack(payload: dict | None) -> dict[str, Any]:
         job["ai_fit_reason"] = verdict.get("fit_reason")
         job["ai_intern_credit"] = verdict.get("intern_credit")
         job["apply_instructions"] = verdict.get("apply_instructions")
+        # kept although years are listed: the post says skilled freshers are welcome (chip + alert line)
+        listed = (verdict.get("min_years_required") or 0) >= 1 or bool(re.match(r"\s*[1-9]\d*\s*(?:-\s*\d+\s*|\+\s*)years", str(job.get("experience") or "")))
+        job["open_to_skilled"] = ((verdict.get("experience_evidence") or "the post welcomes freshers")
+                                  if (job["status"] == "keep" and listed and verdict.get("freshers_welcome")) else None)
         job["contacts_summary"] = contacts.summary(job) if job["status"] != "reject" else None
         job["employer"] = contacts.resolve_company(job)  # real employer; "" when the board hides it
         job["application"] = apps.get(job["uid"])
         job["outreach"] = reached.get(job["uid"])
     jobs = _newest_first(_collapse_duplicates(jobs))
+    if slim:  # the web list: ~12k jobs x full text was 56 MB per load (Nov 6 2026). Rejected jobs load their text on demand.
+        for j in jobs:
+            d = j.get("description") or ""
+            if j["status"] == "reject":
+                j["description"], j["lazy_description"] = "", bool(d)
+                for k in ("skills", "work_type", "blog_url", "apply_instructions", "contacts_summary", "outreach", "application",
+                          "ai_evidence", "ai_stack", "ai_intern_credit", "ai_fit_reason"):
+                    j.pop(k, None)
+            elif len(d) > 6000:
+                j["description"], j["lazy_description"] = d[:6000] + "…", True
     counts = Counter(j["status"] for j in jobs)
     return {
         "fetched_at": (payload or {}).get("fetched_at"),
@@ -421,6 +449,9 @@ def _add_cookie(send, token: str):
 
 
 app.add_middleware(UserContext)
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=1500)  # the job list is ~11 MB of JSON: ~1.5 MB compressed
 
 
 @app.middleware("http")
@@ -469,29 +500,29 @@ def _token(request: Request) -> str | None:
 def index():
     if not users.prefs().get("onboarded", True):
         return RedirectResponse("/onboarding")
-    return FileResponse(STATIC / "index.html")
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/login")
 def login_page():
     if users.current() and users.local_mode():  # already signed in automatically (local mode)
         return RedirectResponse("/")
-    return FileResponse(STATIC / "login.html")
+    return FileResponse(STATIC / "login.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/onboarding")
 def onboarding_page() -> FileResponse:
-    return FileResponse(STATIC / "onboarding.html")
+    return FileResponse(STATIC / "onboarding.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/autoapply")
 def autoapply_page() -> FileResponse:
-    return FileResponse(STATIC / "autoapply.html")
+    return FileResponse(STATIC / "autoapply.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/account")
 def account_page() -> FileResponse:
-    return FileResponse(STATIC / "account.html")
+    return FileResponse(STATIC / "account.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/health")
@@ -510,12 +541,12 @@ def favicon() -> Response:
 
 @app.get("/privacy")
 def privacy_page() -> FileResponse:
-    return FileResponse(STATIC / "privacy.html")
+    return FileResponse(STATIC / "privacy.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/terms")
 def terms_page() -> FileResponse:
-    return FileResponse(STATIC / "terms.html")
+    return FileResponse(STATIC / "terms.html", headers={"Cache-Control": "no-cache"})
 
 
 class Credentials(BaseModel):
@@ -816,16 +847,50 @@ def onboarding_save(body: dict) -> dict:
     return onboarding.save(body.get("profile") or {}, body.get("prefs") or {})
 
 
+# The packed job list is expensive (~2-3 s for 12k jobs: HTML stripping, verdicts, duplicate collapsing) and the page
+# asks again and again. Reuse the last result while none of the files it is built from has changed.
+_PACK_MEMO: dict[tuple, dict] = {}
+
+
+def _mt(name: str, root: bool = False) -> int:
+    try:
+        return (contacts.CACHE_PATH if root else users.path(name)).stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _pack_key(extra: tuple = ()) -> tuple:
+    return (users.current(), time.strftime("%Y-%m-%d"), _mt("jobs_cache.json"), _mt("llm_verdicts.json"), _mt("visited.json"),
+            _mt("applications.json"), _mt("outreach_log.json"), _mt("contacts", True), *extra)
+
+
 @app.get("/api/jobs")
-def cached_jobs() -> dict:
+def cached_jobs(slim: bool = False) -> dict:
     live_poller.ensure_running(_start_checker, _start_fetch)
+    key = _pack_key((slim,))
+    hit = _PACK_MEMO.get(key)
+    if hit is not None:
+        return hit
     payload = load_cache()
     # Unchecked jobs (new, or left over when Groq's daily limit ran out) start the checker; after a
     # quota error it waits 30 minutes before trying again.
     if (payload and not _T()["check"]["running"] and not os.getenv("JF_NO_AUTOCHECK")
             and any(llm_filter.cached_verdict(j) is None for j in _normalized_jobs(payload))):
         _start_checker()
-    return _pack(payload)
+    result = _pack(payload, slim)
+    for k in [k for k in _PACK_MEMO if k[0] == key[0] and k[-1] == slim]:
+        del _PACK_MEMO[k]  # keep only the newest result per user and kind
+    _PACK_MEMO[key] = result
+    return result
+
+
+@app.get("/api/job/description")
+def job_description(uid: str) -> dict:
+    """Full text of one job (the list sends rejected jobs without it)."""
+    job = next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == uid), None)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found in the latest fetch")
+    return {"uid": uid, "description": job.get("description") or ""}
 
 
 @app.get("/api/usage")
@@ -840,8 +905,10 @@ def status() -> dict:
 
 
 @app.post("/api/fetch", status_code=202)
-def fetch_jobs() -> dict:
-    """Fetch everywhere now: the live boards (LinkedIn round, Indeed, Internshala, Wellfound) start at
+def fetch_jobs(hours: str = "latest") -> dict:
+    """hours = latest (since the last read) | 1 | 3 | 24 | all (CATCHUP_DAYS back): how far back to read. Jobs already
+    fetched are never fetched again.
+    Fetch everywhere now: the live boards (LinkedIn round, Indeed, Internshala, Wellfound) start at
     once and save jobs as they find them; the regular fetch covers Naukri, career pages and Telegram."""
     live_poller.ensure_running(_start_checker, _start_fetch)
     if not cfg.LIVE_AUTO:  # manual mode: first what the cloud found, then every board once
@@ -851,7 +918,16 @@ def fetch_jobs() -> dict:
             telegram_bot.cloud_sync(_start_checker)
         except Exception:  # noqa: BLE001 — no cloud / offline: the boards are still read
             pass
-        if not live_poller.run_once(_start_checker, _start_fetch):
+        if hours == "all":
+            back = float(cfg.CATCHUP_DAYS * 24)
+        elif hours == "latest":
+            back = None
+        else:
+            try:
+                back = min(max(float(hours), 0.25), cfg.CATCHUP_DAYS * 24)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="hours must be latest, all or a number") from None
+        if not live_poller.run_once(_start_checker, _start_fetch, back):
             raise HTTPException(status_code=409, detail="A fetch is already running")
         return _status()
     live = live_poller.run_now()
@@ -978,7 +1054,8 @@ def _recently_opened(url: str, page_text: str, jobs: list[dict[str, Any]]) -> di
     for j in recent:
         words = [w for w in _re.sub(r"[^a-z0-9]+", " ", str(j.get("employer") or j.get("company") or "").lower()).split()
                  if len(w) > 2 and w not in {"pvt", "ltd", "private", "limited", "india", "technologies", "solutions", "the"}]
-        if words and words[0] in hay:
+        # the whole name (first two words) as separate words: "data" or "tech" alone must never pick a job
+        if words and len(" ".join(words[:2])) >= 4 and f" {' '.join(words[:2])} " in f" {hay} ":
             return j
     return None
 
@@ -993,11 +1070,11 @@ def autofill(body: AutofillRequest) -> dict:
     job = job or applicant.find_job(body.url, f"{body.title}\n{body.page_text}", jobs)
     job = job or _recently_opened(body.url, f"{body.title}\n{body.page_text}", jobs)
     if job:
-        context = (f"Job: {job['title']} at {job.get('employer') or job.get('company')} ({job.get('location')})\n"
-                   f"{(job.get('description') or '')[:4000]}")
+        context = applicant.job_header(job) + (job.get("description") or "")[:4000]
     else:
-        context = f"Page: {body.title}\n{body.url}\n{body.page_text[:4000]}"
-    answers = applicant.autofill(body.fields, context)
+        context = (f"(The exact job is unknown: do NOT state a role or company name unless the page text below says it.)\n"
+                   f"Page: {body.title}\n{body.url}\n{body.page_text[:4000]}")
+    answers = applicant.autofill(body.fields, context, job)
     instructions = (llm_filter.cached_verdict(job) or {}).get("apply_instructions") if job else None
     return {
         "answers": answers,
@@ -1056,6 +1133,32 @@ def start_autoapply(body: AutoApplyRequest) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class AutoApplyUrl(BaseModel):
+    url: str
+
+
+@app.post("/api/autoapply/url")
+def autoapply_url(body: AutoApplyUrl) -> dict:
+    """Apply to one job link the user (or Claude Code) names: import it, then the extension applies with the app's
+    own free AI keys (no AI verdict needed: the user picked it). Returns a short summary."""
+    from fresherpilot.apply import autoapply
+    from fresherpilot.jobs import missed
+
+    try:
+        rep = missed.report(body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = missed.find(body.url, load_cache().get("jobs") or [])
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Could not read that job link ({rep.get('error') or 'unknown'})")
+    uid = f"{job.get('source')}:{job.get('id')}"
+    try:
+        autoapply.start([uid], 1, None, None, None, [uid])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"queued": uid, "title": job.get("title"), "company": job.get("company")}
+
+
 class AutoApplyChoice(BaseModel):
     action: str  # block | unblock (company) ; allow | never (uid)
     company: str = ""
@@ -1107,6 +1210,25 @@ def autoapply_status() -> dict:
     return autoapply.status()
 
 
+@app.get("/api/extension/version")
+def extension_version() -> dict:
+    """The version of the extension files in this project (the page compares it with the one running in Chrome)."""
+    import json as _json
+
+    try:
+        return {"version": _json.loads((ROOT / "extension" / "manifest.json").read_text(encoding="utf-8")).get("version")}
+    except (OSError, ValueError):
+        return {"version": None}
+
+
+@app.get("/api/autoapply/pending")
+def autoapply_pending() -> dict:
+    """The extension pulls a started run it has not got yet (it asks every ~30 s), so Start works without a page."""
+    from fresherpilot.apply import autoapply
+
+    return {"start": autoapply.take_pending()}
+
+
 @app.post("/api/autoapply/decide")
 def autoapply_decide(body: dict) -> dict:
     from fresherpilot.apply import autoapply
@@ -1155,10 +1277,10 @@ def autoapply_command(body: AutoApplyCommand) -> dict:
 
 
 @app.get("/api/autoapply/command")
-def autoapply_take_command(uid: str | None = None, run: str | None = None) -> dict:
+def autoapply_take_command(uid: str | None = None, run: str | None = None, accept: str | None = None) -> dict:
     from fresherpilot.apply import autoapply
 
-    return {"command": autoapply.take_command(uid, run)}
+    return {"command": autoapply.take_command(uid, run, [a for a in (accept or "").split(",") if a] or None)}
 
 
 # ---------------------------------------------------------------- dashboard + outreach
@@ -1245,6 +1367,95 @@ def outreach_job(uid: str) -> dict:
     return {"sent": [e for e in outreach.log() if e["uid"] == uid], "counts": outreach.for_job(uid)}
 
 
+_UNCHECKED_MEMO: dict[str, tuple[tuple, int]] = {}
+_READY_MEMO: dict[str, tuple[tuple, tuple]] = {}
+
+
+def _unchecked_count() -> int:
+    """Jobs the AI has not rated yet (cached while the files are unchanged: counting costs ~1 s for 12k jobs)."""
+    uid = users.current() or ""
+    key = _pack_key()
+    memo = _UNCHECKED_MEMO.get(uid)
+    if memo and memo[0] == key:
+        return memo[1]
+    n = sum(1 for j in _normalized_jobs(load_cache()) if llm_filter.cached_verdict(j) is None)
+    _UNCHECKED_MEMO[uid] = (key, n)
+    return n
+
+
+def _ai_consumer() -> None:
+    """The AI check as its own worker (a queue consumer): whenever jobs are waiting and it is idle, it starts. Before,
+    the check started only after a fetch finished or when the page asked for the job list, so a fetch could sit with
+    unrated jobs for minutes and each stage waited for the others."""
+    ticks = 0
+    while True:
+        ticks += 1
+        try:
+            chk = _T()["check"]
+            if not chk["running"] and time.time() >= chk.get("paused_until", 0) and (_unchecked_count() > 0 or ticks % 30 == 0):
+                _start_checker()  # every 10 min even when nothing is waiting: re-opens stale free rejects after a rule change
+            from fresherpilot.apply import autoapply
+
+            autoapply.watchdog()  # a run nobody picked up / a silent extension must not show "running" forever
+        except Exception:  # noqa: BLE001 — never let the worker die
+            traceback.print_exc()
+        time.sleep(20)
+
+
+_COUNTING: set[str] = set()
+
+
+def _stage_counts() -> tuple[int | None, int | None]:
+    """(unrated jobs, jobs ready to auto-apply) for the pipeline strip. Counting is slow right after a start (~10 s for
+    12k jobs), so a miss starts it in the background and answers (None, None); the next poll has the numbers."""
+    uid = users.current() or ""
+    key = _pack_key(("counts", _mt("autoapply_prefs.json"), _mt("autoapply_log.jsonl")))
+    memo = _READY_MEMO.get(uid)
+    if memo and memo[0] == key:
+        return memo[1]
+    if uid not in _COUNTING:
+        _COUNTING.add(uid)
+
+        def work() -> None:
+            try:
+                from fresherpilot.apply import autoapply
+
+                waiting = _unchecked_count()
+                try:
+                    ready = len(autoapply.eligible_jobs())
+                except Exception:  # noqa: BLE001
+                    ready = None
+                _READY_MEMO[uid] = (key, (waiting, ready))
+            finally:
+                _COUNTING.discard(uid)
+
+        users.thread(work)
+    return (memo[1] if memo else (None, None))  # the previous numbers are fine for a moment
+
+
+@app.get("/api/pipeline")
+def pipeline() -> dict:
+    """The three stages side by side, each with its own queue (they run independently):
+    1 reading boards -> 2 AI rating (queue = unrated jobs) -> 3 auto-apply (queue = approved jobs not applied yet)."""
+    from fresherpilot.apply import autoapply
+
+    st = _status()
+    aa = autoapply.status()
+    chk = st["check"]
+    waiting, ready = _stage_counts()  # None while the first count is still running (never blocks this request)
+    live = st["live"] or {}
+    return {
+        "read": {"busy": bool(live.get("busy") or st["fetch"]["running"]), "boards": live.get("boards") or {},
+                 "manual": live.get("manual")},
+        "rate": {"running": chk["running"], "waiting": waiting, "stage": chk.get("stage"), "done": chk.get("done"),
+                 "total": chk.get("total"), "paused_until": chk.get("paused_until") or 0, "error": chk.get("error")},
+        "apply": {"running": aa["running"], "ready": ready, "queued": max(0, (aa.get("total") or 0) - (aa.get("index") or 0)),
+                  "applied": aa.get("applied"), "skipped": aa.get("skipped"), "failed": aa.get("failed"),
+                  "waiting_for_you": len(aa.get("parked") or []) + (1 if aa.get("waiting") else 0),
+                  "extension_seen_s": aa.get("ext_seen_s")},
+    }
+
+
 @app.on_event("startup")
 def _autostart() -> None:
     """Local mode: start the owner's job readers and AI check with the server, so jobs keep coming
@@ -1265,6 +1476,8 @@ def _autostart() -> None:
         users.set_current(uid)
         live_poller.ensure_running(_start_checker, _start_fetch)
         _start_checker()
+        users.thread(_ai_consumer)  # independent AI stage (see _ai_consumer)
+        users.thread(lambda: cached_jobs(True))  # warm the packed job list so the first page load is not a 9 s wait
 
     threading.Thread(target=start, daemon=True).start()
 
@@ -1295,7 +1508,28 @@ def run() -> None:
     # 127.0.0.1 only: the internet reaches the app through Cloudflare Tunnel, never directly.
     host, port = os.getenv("FP_HOST", "127.0.0.1"), int(os.getenv("FP_PORT", "8000"))
     print(f"FresherPilot running at http://localhost:{port}  (Ctrl+C to stop)")
-    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="127.0.0.1")
+    config = uvicorn.Config(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="127.0.0.1")
+    server = uvicorn.Server(config)
+    if host == "127.0.0.1":
+        # Windows resolves "localhost" to ::1 first. Listening on IPv4 only made EVERY request from the browser /
+        # extension wait ~2 s for the IPv6 attempt to fail (measured Nov 6 2026: /api/health 2.04 s vs 0.00 s on
+        # 127.0.0.1). Listen on both loopback addresses (still local only).
+        import socket
+
+        socks = []
+        for family, addr in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock.bind((addr, port))
+                socks.append(sock)
+            except OSError:
+                if family == socket.AF_INET:
+                    print(f"\nFresherPilot is already running (port {port} is in use).\n"
+                          f"Open http://localhost:{port} in your browser. To restart it, close the other FresherPilot window first.")
+                    return
+        server.run(sockets=socks)
+    else:
+        server.run()
 
 
 if __name__ == "__main__":

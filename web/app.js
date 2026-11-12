@@ -77,6 +77,15 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 const safeUrl = (u) => (/^https?:\/\//i.test(u || "") ? u : "");
+// Same tag as the Telegram buttons: the extension reads fp_job to know which job a tab (and its redirects) is for.
+function fpTag(url, uid) {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol) || u.searchParams.has("fp_job") || !uid) return url;
+    u.searchParams.set("utm_source", "fresherpilot"); u.searchParams.set("utm_medium", "app"); u.searchParams.set("fp_job", uid);
+    return u.toString();
+  } catch { return url; }
+}
 
 function formatWhen(iso) {
   if (!iso) return "–";
@@ -175,11 +184,11 @@ async function loadKit(uid, generate) {
   if (state.selected === uid) renderDetail();
 }
 
-// "Didn't apply?": not applied and back to unvisited (shows as new again).
+// "Didn't apply?": opening a job counts as applied; this takes the applied mark off but keeps it visited.
 async function didntApply(uid) {
   const job = findJob(uid);
   if (job?.application) await setStatus(uid, "");
-  await setVisited([uid], false);
+  if (!findJob(uid)?.visited_at) await setVisited([uid], true);
 }
 
 async function setStatus(uid, status) {
@@ -236,6 +245,8 @@ function fitChip(job) {
 }
 
 function yearsChip(job) {
+  if (job.open_to_skilled)
+    return `<span class="chip warn" title="${escapeHtml("The post lists years but says: " + job.open_to_skilled)}">Lists ${job.ai_years >= 1 ? job.ai_years + "+ yrs" : "years"} · skilled freshers welcome</span>`;
   if (job.ai_category === "stretch")
     return `<span class="chip warn" title="${escapeHtml(job.ai_evidence || "Asks for about 1 year; freshers often still get calls")}">Stretch · asks 1 yr</span>`;
   if (job.ai_freshers) return `<span class="chip hit">Freshers welcome</span>`;
@@ -322,7 +333,7 @@ function itemHtml(job) {
       <div class="job-side">
         <label class="visit" title="Mark as visited"><input type="checkbox" data-visit="${escapeHtml(job.uid)}" ${isVisited ? "checked" : ""} /><span>Visited</span></label>
         ${isRejected ? "" : job.application
-          ? `<span class="quick-apply on">✓ Applied</span><button type="button" class="undo-apply" data-notapplied="${escapeHtml(job.uid)}" title="Not applied after all: mark not applied and unvisited">Didn't apply?</button>`
+          ? `<span class="quick-apply on">✓ Applied</span><button type="button" class="undo-apply" data-notapplied="${escapeHtml(job.uid)}" title="Not applied after all: remove the applied mark, keep it as visited">Didn't apply?</button>`
           : `<button type="button" class="quick-apply" data-quickapply="${escapeHtml(job.uid)}" title="Mark as applied (also marks it visited)">Mark applied</button>`}
       </div>
     </li>`;
@@ -456,8 +467,9 @@ function renderDetail() {
     detailEl.innerHTML = `<div class="placeholder"><p>Select a job to see details and people to reach out to.</p></div>`;
     return;
   }
-  const url = safeUrl(job.url);
+  const url = fpTag(safeUrl(job.url), job.uid);
   const isRejected = job.status === "reject";
+  if (job.lazy_description) setTimeout(() => loadFullDescription(job.uid), 0);  // after this render has put the text box in place
   const meta = [job.location, job.experience, job.salary, postedLabel(job)]
     .filter((x) => x && x !== "Not disclosed" && x !== "Not specified")
     .map(escapeHtml)
@@ -493,8 +505,8 @@ function renderDetail() {
     ${job.status !== "reject" && (job.visited_at || job.application) ? `<div class="applied-ask">
       ${job.application
         ? `<span>✓ Marked as applied.</span>`
-        : `<span>Opened this job. Did you apply?</span><button type="button" class="btn small" data-quickapply="${escapeHtml(job.uid)}">Yes, applied</button>`}
-      <button type="button" class="btn small ghost" data-notapplied="${escapeHtml(job.uid)}">Didn't apply? Mark unvisited</button>
+        : `<span>Visited, not applied.</span><button type="button" class="btn small" data-quickapply="${escapeHtml(job.uid)}">Mark applied</button>`}
+      ${job.application ? `<button type="button" class="btn small ghost" data-notapplied="${escapeHtml(job.uid)}">Didn't apply? Keep as visited only</button>` : ""}
     </div>` : ""}
     <section class="card">
       <div class="chips">
@@ -509,7 +521,20 @@ function renderDetail() {
     ${kitHtml(job)}
     ${contactsHtml(job)}
     ${skills ? `<section class="card"><h3>Your skills in this job</h3><div class="chips">${skills}</div></section>` : ""}
-    <section class="card"><h3>Description</h3><div class="description">${escapeHtml(job.description || "No description.")}</div></section>`;
+    <section class="card"><h3>Description</h3><div class="description" data-desc="${escapeHtml(job.uid)}">${escapeHtml(job.description || (job.lazy_description ? "Loading the full description…" : "No description."))}</div></section>`;
+}
+
+// Rejected jobs (and very long texts) come without the full description: fetch it when the job is opened.
+async function loadFullDescription(uid) {
+  const job = findJob(uid);
+  if (!job || !job.lazy_description || job._descLoading) return;
+  job._descLoading = true;
+  try {
+    const r = await fetch(`/api/job/description?uid=${encodeURIComponent(uid)}`);
+    if (r.ok) { job.description = (await r.json()).description || ""; job.lazy_description = false; }
+  } finally { job._descLoading = false; }
+  const el = document.querySelector(`[data-desc="${CSS.escape(uid)}"]`);
+  if (el) el.textContent = job.description || "No description.";
 }
 
 async function loadContacts(uid, refresh = false) {
@@ -563,7 +588,10 @@ function render(data) {
   $("statKept").textContent = data.total_kept ?? 0;
   $("statNew").textContent = data.total_new ?? 0;
   $("statRejected").textContent = data.total_rejected ?? 0;
-  $("statWhen").textContent = formatWhen(data.fetched_at);
+  // Jobs also arrive from the cloud and the live readers between "Fetch" presses: show when the newest one was found.
+  const newest = (data.jobs || []).reduce((m, j) => { const t = Date.parse(j.first_seen || ""); return t > m ? t : m; }, 0);
+  $("statWhen").textContent = newest ? formatWhen(new Date(newest).toISOString()) : formatWhen(data.fetched_at);
+  $("statWhen").parentElement.firstElementChild.textContent = newest ? "Newest job found" : "Last fetch";
   $("tabNew").hidden = !data.total_new;
   $("tabNew").textContent = data.total_new || "";
   $("toolbar").hidden = !jobs().length;
@@ -755,7 +783,7 @@ async function loadJobs() {
   // One request at a time: after a big fetch the first load can take a while.
   if (loadInFlight) return loadInFlight;
   loadInFlight = (async () => {
-    const res = await fetch("/api/jobs");
+    const res = await fetch("/api/jobs?slim=true");
     if (!res.ok) throw new Error(`Server error ${res.status}`);
     const data = await res.json();
     if (data.fetched_at) render(data);
@@ -843,7 +871,9 @@ detailEl.addEventListener("click", async (e) => {
   const open = e.target.closest("[data-open]");
   if (open) {
     const job = findJob(open.dataset.open);
-    if (job && !job.visited_at) setTimeout(() => setVisited([job.uid], true), 0); // opening = visited (untick to undo)
+    // opening = applied (which also marks it visited); "Didn't apply?" turns it into visited only
+    if (job && !job.application && job.status !== "reject") setTimeout(() => setStatus(job.uid, "applied"), 0);
+    else if (job && !job.visited_at) setTimeout(() => setVisited([job.uid], true), 0);
     return;
   }
   const quickD = e.target.closest("[data-quickapply]");
@@ -922,11 +952,14 @@ $("sources").addEventListener("click", (e) => {
   renderList();
 });
 
+try { $("fetchRange").value = localStorage.getItem("fetchRange") || "latest"; } catch (e) { /* default */ }
 fetchBtn.addEventListener("click", async () => {
   if (fetchBtn.classList.contains("busy")) return; // already fetching; progress is shown on the button
   setFetchButton({ fetch: { running: true } });
   try {
-    const res = await fetch("/api/fetch", { method: "POST" });
+    const range = $("fetchRange").value;
+    try { localStorage.setItem("fetchRange", range); } catch (e) { /* private mode */ }
+    const res = await fetch(`/api/fetch?hours=${encodeURIComponent(range)}`, { method: "POST" });
     if (!res.ok && res.status !== 409) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.detail || "Fetch failed");
@@ -1104,14 +1137,14 @@ function showView(name) {
   if (!["dashboard", "jobs"].includes(name)) name = "dashboard";
   $("dashboardView").hidden = name !== "dashboard";
   $("jobsView").hidden = name !== "jobs";
-  document.querySelectorAll(".tab").forEach((t) => {
+  document.querySelectorAll(".tab[data-view]").forEach((t) => {
     t.classList.toggle("on", t.dataset.view === name);
     t.setAttribute("aria-current", t.dataset.view === name ? "page" : "false");
   });
   if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   if (name === "dashboard" && typeof refreshDashboard === "function") refreshDashboard();
 }
-document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => showView(t.dataset.view)));
+document.querySelectorAll(".tab[data-view]").forEach((t) => t.addEventListener("click", () => showView(t.dataset.view)));
 window.addEventListener("hashchange", () => showView(location.hash.slice(1)));
 
 function toast(message, ms = 3500) {
@@ -1149,3 +1182,42 @@ fetch("/api/me").then((r) => r.json()).then((me) => {
   if (me.user) $("userBtn").textContent = `${me.user.username} · Settings`;
   if (me.extension_token && hasExtension()) toExtension({ type: "jf-set-token", token: me.extension_token }).catch(() => {});
 }).catch(() => {});
+
+
+// ---------------------------------------------------------------- pipeline strip (3 independent stages)
+(function pipelineStrip() {
+  const set = (id, cls, big, sub) => {
+    const box = $(id), b = $(id + "Big"), t = $(id + "Sub");
+    if (!box || !b || !t) return;
+    box.classList.toggle("busy", cls === "busy");
+    box.classList.toggle("warn", cls === "warn");
+    b.textContent = big;
+    t.textContent = sub;
+  };
+  const n = (x) => (x || 0).toLocaleString();
+  async function tick() {
+    if (document.hidden) return;
+    try {
+      const r = await fetch("/api/pipeline");
+      if (!r.ok) return;
+      const p = await r.json();
+      const busyBoards = Object.entries(p.read.boards || {}).filter(([, v]) => v && v.busy).map(([k]) => k);
+      set("stRead", p.read.busy ? "busy" : "", p.read.busy ? "Reading…" : "Idle",
+        busyBoards.length ? busyBoards.join(", ") : "The cloud also reads 24/7; Fetch pulls it in");
+      const rt = p.rate;
+      const paused = rt.paused_until && rt.paused_until * 1000 > Date.now();
+      set("stRate", rt.error ? "warn" : rt.running ? "busy" : "", rt.running ? `Rating ${n(rt.done)}/${n(rt.total)}` : rt.waiting == null ? "counting…" : `${n(rt.waiting)} waiting`,
+        rt.error ? String(rt.error).slice(0, 80) : paused ? "AI limit reached: resumes " + new Date(rt.paused_until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : rt.running ? (rt.stage || "") : rt.waiting ? "starts automatically" : rt.waiting == null ? "" : "all jobs rated");
+      const ap = p.apply;
+      const stuck = ap.running && ap.extension_seen_s != null && ap.extension_seen_s > 25;
+      set("stApply", stuck || ap.waiting_for_you ? "warn" : ap.running ? "busy" : "", ap.running ? `${n(ap.queued)} queued` : ap.ready == null ? "counting…" : `${n(ap.ready)} ready`,
+        stuck ? "Chrome extension not answering: open Auto-apply and press Reset"
+          : ap.waiting_for_you ? `✋ ${ap.waiting_for_you} waiting for you`
+          : ap.running ? `applied ${n(ap.applied)} · skipped ${n(ap.skipped)} · failed ${n(ap.failed)}` : "approved jobs not applied yet");
+    } catch (e) { /* app restarting: next tick */ }
+  }
+  tick();
+  setInterval(tick, 3000);
+  document.addEventListener("visibilitychange", tick);
+})();

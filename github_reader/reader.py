@@ -160,7 +160,7 @@ def read_linkedin(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
     # a new machine split starts where the last LinkedIn read (any split) ended, not 3 days back
     last = read.get(li_key()) or max([v for k, v in read.items() if k.startswith("linkedin")] or [0]) or None
     window, _ = window_for(last, cfg["laptop_seen"], cfg["posted_within_days"])
-    pages = 1 if window <= 3600 else min(40, 2 + window // 3600)  # longer gap: read deeper
+    pages = 3 if window <= 3600 else min(40, 3 + window // 3600)  # page 1 all new = read on (a hot search has >10 new in a window)  # longer gap: read deeper
     new_cards: dict[str, dict] = {}
     searches = cfg["li_searches"]
     if SHARD in ("li0", "li1"):
