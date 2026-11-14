@@ -284,6 +284,14 @@ def _direct_answer(field: dict[str, Any], rules: list[tuple[re.Pattern[str], str
         return None
     if field.get("type") in ("checkbox", "file"):  # e.g. "Email me updates" is a choice, not the email address
         return None
+    # Nov 14: "Email Why should we hire you?" / "...we will email your answer" (a textarea whose captured label also held a neighbouring
+    # label or helper text) got the profile EMAIL typed into the essay box. Profile answers are for short field-like labels only; an
+    # essay box (textarea) or a long / question-like label goes to the AI.
+    words = len(label.split())
+    if field.get("type") == "textarea" and (words > 4 or "?" in label):
+        return None
+    if words > 10 or ("?" in label and words > 6):
+        return None
     for rx, value in rules:
         if rx.search(label):
             if value.startswith("CTC:"):

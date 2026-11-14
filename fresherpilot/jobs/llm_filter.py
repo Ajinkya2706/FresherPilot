@@ -253,7 +253,11 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
     # "mid" is a soft label; a stated requirement of <=1 year or "freshers welcome" outranks it.
     # A "mid"/"senior" label with NO years and NO quoted evidence is the model's guess from a short post
     # (Nov 11: Scoutit "AI Engineer" / "Software Engineer" rejected that way): let it through to the skill-fit check.
-    guess = (facts.get("seniority") in ("mid", "senior") and years is None and not str(facts.get("experience_evidence") or "").strip()
+    # Nov 14 (owner: a post that doesn't mention experience must come in): the AI's "evidence" counts only when it actually speaks of years or
+    # seniority; a quote like "Run Models on xhawk cloud infrastructure" or "Software Development Engineers build code" is no evidence.
+    ev = str(facts.get("experience_evidence") or "")
+    ev_real = bool(re.search(r"\d+\s*\+?\s*(?:-|\u2013|to)?\s*\d*\s*(?:years?|yrs?)|\bsenior\b|\blead\b|principal|experienced|expert|seasoned|mid[- ]level", ev, re.I))
+    guess = (facts.get("seniority") in ("mid", "senior") and years is None and not ev_real
              and not re.search(r"senior|lead|principal|staff|manager|head|architect|\b(?:ii|iii|iv|2|3|4)\s*$", str(job.get("title") or ""), re.I))
     if facts.get("seniority") not in ALLOWED_SENIORITY and not guess and not (facts.get("seniority") == "mid" and (freshers or low_years)):
         return "reject", "too_senior"

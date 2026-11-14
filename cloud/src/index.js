@@ -162,7 +162,9 @@ function decide(f, job) {  // llm_filter.decide
   if (!["full_time", "unclear"].includes(f.employment_type)) return ["reject", "not_full_time"];
   const rf = CONFIG.reject_from_years;
   const low = typeof years === "number" && years < rf;
-  const guess = ["mid", "senior"].includes(f.seniority) && (years === null || years === undefined) && !String(f.experience_evidence || "").trim() &&
+  // Nov 14: the AI's "evidence" counts only when it speaks of years or seniority (llm_filter.decide)
+  const evReal = /\d+\s*\+?\s*(?:-|\u2013|to)?\s*\d*\s*(?:years?|yrs?)|\bsenior\b|\blead\b|principal|experienced|expert|seasoned|mid[- ]level/i.test(String(f.experience_evidence || ""));
+  const guess = ["mid", "senior"].includes(f.seniority) && (years === null || years === undefined) && !evReal &&
     !/senior|lead|principal|staff|manager|head|architect|\b(?:ii|iii|iv|2|3|4)\s*$/i.test(String(job.title || ""));  // model's guess from a short post: let the fit check judge
   if (!["entry", "unclear"].includes(f.seniority) && !guess && !(f.seniority === "mid" && (freshers || low))) return ["reject", "too_senior"];
   if (/director|executive/i.test(level)) return ["reject", "too_senior"];
@@ -1454,6 +1456,18 @@ async function route(req, env, ctx) {
       return json({ sent: await sendAlert(env, new Budget(10), body) });
     }
     if (url.pathname === "/api/claim" && req.method === "POST") return json({ fresh: await claim(env, (await req.json()).keys || []) });
+    if (url.pathname === "/api/mark" && req.method === "POST") {
+      // The app marked jobs applied / seen: Telegram's alerts and /jobs must stop showing them (the app -> Telegram direction;
+      // Telegram -> app is /api/actions). "applied" wins over "seen"; "hidden" taps are never overwritten.
+      const marks = ((await req.json()).marks || []).filter((m) => Array.isArray(m) && typeof m[0] === "string").slice(0, 400);
+      const st = [];
+      for (const [uid, what] of marks) {
+        if (what === "applied") st.push(env.DB.prepare("UPDATE alerts SET state = 'applied' WHERE uid = ? AND (state IS NULL OR state = 'seen')").bind(uid));
+        else if (what === "seen") st.push(env.DB.prepare("UPDATE alerts SET state = 'seen' WHERE uid = ? AND state IS NULL").bind(uid));
+      }
+      if (st.length) await env.DB.batch(st);
+      return json({ marked: st.length });
+    }
     if (url.pathname === "/api/actions") {
       const since = +(url.searchParams.get("since") || 0);
       return json({ actions: (await env.DB.prepare(`SELECT a.*, j.title, j.company, j.description FROM actions a

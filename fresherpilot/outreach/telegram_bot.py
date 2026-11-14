@@ -393,10 +393,48 @@ def cloud_sync(on_new: Callable[[], Any] | None = None) -> dict[str, int]:
         visited.mark([job], True)
         if a["action"] == "a":
             applicant.set_application(visited.uid(job), "applied")
+    pushed = 0
+    try:
+        pushed = _push_marks(st)
+    except Exception:  # noqa: BLE001 — marks are retried at the next sync
+        pass
     users.write_atomic(_sync_path(), json.dumps(st))
     if added and on_new:
         on_new()
-    return {"jobs": added, "actions": len(actions)}
+    return {"jobs": added, "actions": len(actions), "marks": pushed}
+
+
+_SOURCES = ("LinkedIn", "Naukri", "Indeed", "Telegram", "Careers", "Internshala", "Wellfound", "Cutshort")
+
+
+def _push_marks(st: dict[str, Any]) -> int:
+    """App -> Telegram: tell the cloud which jobs were marked applied / opened here (Nov 14: 165 applied and 669 opened jobs were still
+    "unmarked" in Telegram's alerts and /jobs). Oldest mark first; st["marks_at"] remembers how far it got, so each sync sends only
+    what is new and a failed call is simply retried."""
+    from fresherpilot.jobs import visited  # noqa: F401
+
+    def read(name: str) -> dict[str, Any]:
+        try:
+            return json.loads(users.path(name).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+
+    marks: dict[str, tuple[str, str]] = {}  # uid -> (timestamp, "seen" | "applied")
+    for key, ts in read("visited.json").items():
+        if key.split(":", 1)[0] in _SOURCES and isinstance(ts, str):
+            marks[key] = (ts, "seen")
+    for key, rec in read("applications.json").items():
+        if isinstance(rec, dict) and rec.get("status") == "applied" and key.split(":", 1)[0] in _SOURCES:
+            marks[key] = (str(rec.get("updated_at") or rec.get("applied_at") or ""), "applied")
+    since = st.get("marks_at") or ""
+    todo = sorted(((ts, uid, what) for uid, (ts, what) in marks.items() if ts > since))
+    sent = 0
+    for i in range(0, len(todo), 300):
+        chunk = todo[i:i + 300]
+        _cloud_call("/api/mark", {"marks": [[uid, what] for _ts, uid, what in chunk]}, timeout=40)
+        st["marks_at"] = chunk[-1][0]
+        sent += len(chunk)
+    return sent
 
 
 def _cloud_verdict(job: dict[str, Any], row: dict[str, Any]) -> dict[str, dict[str, Any]]:

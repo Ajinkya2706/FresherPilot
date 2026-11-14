@@ -639,6 +639,11 @@
         const entry = registry.get(a.id);
         if (!entry) continue;
         let ok = false;
+        // Nov 14: an email address / phone number must never land in an essay box ("Why should we hire you?"), nor an essay in an email box
+        const v = String(a.value || "").trim();
+        const looksEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v), looksPhone = /^[+\d][\d\s\-()]{7,}$/.test(v);
+        const wrongPlace = (entry.type === "textarea" && (looksEmail || looksPhone)) || (entry.type === "email" && !looksEmail);
+        if (a.value && wrongPlace) { a.value = ""; a.needs_review = true; }
         if (a.value) {
           try {
             ok = await apply(entry, a.value);
