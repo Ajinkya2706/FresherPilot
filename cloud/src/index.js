@@ -110,6 +110,8 @@ function titleExcluded(title) {  // llm_filter.title_excluded
   }
   const m = String(title || "").match(new RegExp(CONFIG.title_years, "i"));
   if (m && parseFloat(m[1]) >= CONFIG.title_years_min) return ["needs_experience", m[0]];
+  const lv = CONFIG.title_level ? String(title || "").match(new RegExp(CONFIG.title_level)) : null;  // Wipro "DEVELOPER L3": L3+ = experienced
+  if (lv) return ["needs_experience", lv[0]];
   return null;
 }
 
@@ -164,13 +166,33 @@ function decide(f, job) {  // llm_filter.decide
     !/senior|lead|principal|staff|manager|head|architect|\b(?:ii|iii|iv|2|3|4)\s*$/i.test(String(job.title || ""));  // model's guess from a short post: let the fit check judge
   if (!["entry", "unclear"].includes(f.seniority) && !guess && !(f.seniority === "mid" && (freshers || low))) return ["reject", "too_senior"];
   if (/director|executive/i.test(level)) return ["reject", "too_senior"];
+  // Nov 14 (later): "Mid-Senior" rejects unless freshers are welcome or years < the limit (llm_filter.decide: IBM sent experienced roles)
   if (/mid-senior/i.test(level) && !(freshers || low)) return ["reject", "too_senior"];
   if (!ALLOWED_ROLES.has(f.role_type)) return ["reject", f.role_type === "non_software_engineering" ? "non_software_engineering" : "non_developer"];
   if (!freshers) {
     if (typeof years === "number" && years >= rf) return ["reject", "needs_experience"];
     if (platformMin && parseInt(platformMin[1], 10) >= rf) return ["reject", "needs_experience"];
+    // the post says "N+ years" and the AI missed it (llm_filter.explicit_years); fresher-titled posts are left to the AI
+    if (!low && explicitYears(job.description) !== null && !/fresher|trainee|graduate|entry|junior|intern|campus|apprentice/i.test(String(job.title || ""))) return ["reject", "needs_experience"];
   }
   return ["keep", "ok"];
+}
+
+const YEARS_RE = /(\d+(?:\.\d+)?)\s*\+?\s*(?:(?:-|–|to)\s*(\d+(?:\.\d+)?))?\s*\+?\s*(?:years?|yrs?)\b/gi;
+const YEARS_SOFT = /less than|up to|upto|under|below|maximum|max\.?|within|preferred|desirable|good to have|nice to have|a plus|bonus|warrant|guarantee|duration|contract of|bond|service agreement|since|founded|established|over the (?:last|past)|for the (?:last|past)|over|more than|collective|anniversar|history|legacy|decades?|we have|we've|\bage\b/i;
+function explicitYears(text) {  // llm_filter.explicit_years: smallest "N years" experience the text requires (>= 2), else null
+  const t = String(text || "").replace(/\s+/g, " ");
+  const found = [];
+  for (const m of t.matchAll(YEARS_RE)) {
+    const lo = parseFloat(m[1]);
+    const before = t.slice(Math.max(0, m.index - 40), m.index), after = t.slice(m.index + m[0].length, m.index + m[0].length + 60);
+    if (!/experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|work(?:ing)?|in (?:a |an )?\w+ (?:role|field)|as a/i.test(before + " " + after)) continue;
+    if (YEARS_SOFT.test(before.slice(-25)) || /^\W{0,3}\(?\s*(?:preferred|desirable|plus|good to have|nice to have|optional)/i.test(after)) continue;
+    if (/preferred|desirable|good to have|nice to have|bonus/i.test(before.slice(-70)) && !/minimum|required|must/i.test(before.slice(-70))) continue;
+    if (lo < 2 || lo > 15) continue;
+    found.push(lo);
+  }
+  return found.length ? Math.min(...found) : null;
 }
 
 // visited._loose_keys: the same job from another board / a repost has the same keys
@@ -349,6 +371,10 @@ async function srcTelegram(env, b) {
       const postUrl = await unshorten(b, j.url);
       if (AD_LINK.test(postUrl)) { jobs.push({ ...j, title: "(ad)", status: "ad" }); continue; }
       j.url = postUrl;
+      if (isBlog(postUrl) && (await env.DB.prepare("SELECT 1 x FROM seen WHERE id = ?").bind(`blogurl:${postUrl}`).first())) {
+        jobs.push({ ...j, title: "(ad)", status: "ad" });  // already read from the blog hours ago (alerted once): remember it as seen
+        continue;
+      }
       if (isBlog(postUrl)) {
         const blog = await resolveBlog(b, postUrl);
         if (blog) {
@@ -366,6 +392,64 @@ async function srcTelegram(env, b) {
   const ads = jobs.filter((j) => j.status === "ad");
   if (ads.length) await env.DB.batch(ads.map((j) => env.DB.prepare("INSERT OR IGNORE INTO seen (id, at) VALUES (?, ?)").bind(uidOf(j), now())));
   return addJobs(env, jobs.filter((j) => j.status !== "ad"));
+}
+
+// FreshersHunt blog (WordPress REST API), read every minute. Measured Nov 14 2026: the blog publishes each drive HOURS before
+// the Telegram channel re-posts it (the channel is an hourly drip, ~1 post at :00-:10 IST; IBM Associate System Engineer: blog
+// 04:53 UTC, Telegram 06:59; Capgemini / Accenture +7.5 h; ServiceNow +9 h). Jobs are stored like Telegram ones (source
+// "Telegram", id "blog:<post id>"); the later Telegram repost of the same blog link is dropped in srcTelegram (seen "blogurl:<link>").
+const BLOG_API = "https://freshershunt.in/wp-json/wp/v2/posts?per_page=15&_fields=id,date_gmt,link,title";
+const BLOG_TYPE = /\b(off[\s-]?campus|internship|work from home|apprentice(?:ship)?|graduate|young|recruitment|hiring|careers?|associate|trainee|software|senior|junior|entry|fresher|engineer|developer|analyst|hackathon|codevita|hackquest)\b/i;
+const BLOG_CITY = /\b(bengaluru|bangalore|hyderabad|pune|mumbai|chennai|gurgaon|gurugram|noida|delhi|kolkata|ahmedabad|jaipur|kochi|coimbatore|indore|chandigarh|remote|work from home|pan india|multiple cities|\d+ cities)\b/gi;
+const BLOG_MAX_AGE = 36 * 3600 * 1000;
+
+function blogJob(p, blog) {
+  const raw = decode(p.title.rendered).replace(/\s*[\u2014\u2013-]\s*Apply Now\s*$/i, "").trim();
+  const segs = raw.split("|").map((x) => x.trim()).filter(Boolean);
+  const head = segs[0] || raw;
+  const m = head.match(BLOG_TYPE);
+  const company = ((m && m.index > 0 ? head.slice(0, m.index) : head.split(" ")[0]) || "").trim() || "Unknown";
+  let role = head.slice(company.length).trim();
+  const bare = role.replace(/\b20\d\d\b/g, "").trim();
+  if (!bare || /^(off[\s-]?campus( drive)?|internship|work from home|careers?|hiring|recruitment)$/i.test(bare)) role = segs[1] || role || raw;
+  else if (segs[1]) role += " | " + segs[1];
+  const body = blog && blog.description ? blog.description : "";
+  const cities = [...new Set([...(raw + " " + body.slice(0, 800)).matchAll(BLOG_CITY)].map((x) => x[1]))];
+  const when = p.date_gmt + "Z";
+  return {
+    id: `blog:${p.id}`, source: "Telegram", title: role.slice(0, 120), company: company.slice(0, 80), experience: "Not specified",
+    location: cities.join(", ") || "India", url: (blog && blog.url) || p.link, blog_url: p.link, posted: when, posted_days: daysAgo(when),
+    description: `${raw}\n\nJob details:\n${body}\n\n(Posted on the FreshersHunt blog: ${p.link})`,
+  };
+}
+
+async function srcBlog(env, b) {
+  const r = await b.fetch(BLOG_API, { headers: { "User-Agent": UA } });
+  if (!r.ok) return 0;
+  const posts = await r.json();
+  if (!Array.isArray(posts) || !posts.length) return 0;
+  const ids = posts.map((p) => `Telegram:blog:${p.id}`);
+  const have = new Set((await env.DB.prepare(`SELECT id FROM seen WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids).all()).results.map((x) => x.id));
+  const init = await getState(env, "blog_init", 0);
+  const skip = [], fresh = [];
+  for (const p of posts) {
+    if (have.has(`Telegram:blog:${p.id}`)) continue;
+    const age = now() - Date.parse(p.date_gmt + "Z");
+    // first run: only posts of the last 90 min count (older ones were already alerted through Telegram)
+    if (age > BLOG_MAX_AGE || (!init && age > 90 * 60000)) skip.push(p); else fresh.push(p);
+  }
+  if (skip.length) await env.DB.batch(skip.map((p) => env.DB.prepare("INSERT OR IGNORE INTO seen (id, at) VALUES (?, ?)").bind(`Telegram:blog:${p.id}`, now())));
+  if (!init) await setState(env, "blog_init", now());
+  const jobs = [];
+  for (const p of fresh.slice(0, 3)) {  // 3 per minute: each opens one page; the rest next minute
+    const blog = await resolveBlog(b, p.link);
+    const official = blog ? await unshorten(b, blog.url || p.link) : p.link;
+    if (AD_LINK.test(official)) { await env.DB.prepare("INSERT OR IGNORE INTO seen (id, at) VALUES (?, ?)").bind(`Telegram:blog:${p.id}`, now()).run(); continue; }
+    const job = blogJob(p, blog ? { ...blog, url: official } : null);
+    jobs.push(job);
+    await env.DB.prepare("INSERT OR IGNORE INTO seen (id, at) VALUES (?, ?)").bind(`blogurl:${p.link}`, now()).run();
+  }
+  return addJobs(env, jobs);
 }
 
 // LinkedIn guest search: one title x city per step, newest first, since that search was last read.
@@ -471,6 +555,34 @@ async function srcCareers(env, b) {
           if (!INDIA.test(loc + " " + country)) continue;
           jobs.push({ id: `ab:${name}:${j.id}`, source: "Careers", title: j.title, company: name, location: loc, posted: j.publishedAt,
                       posted_days: daysAgo(j.publishedAt), url: j.jobUrl, work_type: j.employmentType || "", description: j.descriptionPlain || decode(j.descriptionHtml) });
+        }
+      } else if (kind === "workday") {  // token "tenant|site|host" (NTT DATA = nttlimited|NTT_Careers|wd3)
+        const [tenant, site, host] = token.split("|");
+        const base = `https://${tenant}.${host}.myworkdayjobs.com/wday/cxs/${tenant}/${site}`;
+        const d = await (await b.fetch(`${base}/jobs`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ appliedFacets: {}, limit: 20, offset: 0, searchText: "India" }) })).json();
+        const cand = [];
+        for (const j of d.jobPostings || []) {
+          const loc = j.locationsText || "";
+          if (!INDIA.test(loc) && !/^\d+ Locations/.test(loc)) continue;
+          const po = j.postedOn || "";
+          const days = /today/i.test(po) ? 0 : /yesterday/i.test(po) ? 1 : (po.match(/(\d+)\+?\s*day/i) || [])[1] !== undefined ? Number(po.match(/(\d+)\+?\s*day/i)[1]) : null;
+          if (days !== null && days > CONFIG.posted_within_days) continue;
+          cand.push({ j, loc, days, path: j.externalPath || "" });
+        }
+        // only jobs we don't have yet get their detail page (full text for the AI): at most 6 per step
+        const ids = cand.map((c) => `wd:${name}:${c.path.split("/").pop()}`);
+        const have = ids.length ? new Set((await env.DB.prepare(`SELECT id FROM jobs WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids).all()).results.map((r) => r.id)) : new Set();
+        let fetched = 0;
+        for (const c of cand) {
+          const id = `wd:${name}:${c.path.split("/").pop()}`;
+          if (have.has(id) || fetched >= 6) continue;
+          fetched++;
+          const det = ((await (await b.fetch(`${base}${c.path}`)).json()).jobPostingInfo) || {};
+          const posted = c.days === null ? "" : new Date(Date.now() - c.days * DAY).toISOString();
+          jobs.push({ id, source: "Careers", title: c.j.title, company: name, location: det.location || c.loc, posted, posted_days: c.days,
+                      url: det.externalUrl || `https://${tenant}.${host}.myworkdayjobs.com/${site}${c.path}`, work_type: det.timeType || "",
+                      description: decode(det.jobDescription || "").replace(/<[^>]+>/g, " ") });
         }
       } else if (kind === "smartrecruiters") {
         const d = await (await b.fetch(`https://api.smartrecruiters.com/v1/companies/${token}/postings?country=in&limit=100`)).json();
@@ -661,7 +773,9 @@ async function srcApify(env, b) {
   }
 
   // 2) start the source that has waited longest, if today's budget allows
-  const lim = (await (await b.fetch(`${APIFY}/users/me/limits`, auth)).json()).data;
+  const limRes = await b.fetch(`${APIFY}/users/me/limits`, auth);
+  const lim = (await limRes.json().catch(() => ({}))).data;
+  if (!lim || !lim.limits) throw new Error(`Apify rejected the token (HTTP ${limRes.status}): put a valid APIFY_API_KEY in .env and run python cloud/deploy.py`);
   const left = lim.limits.maxMonthlyUsageUsd - lim.current.monthlyUsageUsd;
   const daysLeft = Math.max(1, Math.ceil((Date.parse(lim.monthlyUsageCycle.endAt) - now()) / DAY));
   const daily = Math.max(0, left / daysLeft);
@@ -891,7 +1005,13 @@ async function aiStep(env, b) {
 
 // ---------------------------------------------------------------- Telegram
 
+// Telegram HTML mode rejects a stray "<" ("< 5 min ago", "C<3"...): escape every "<" that doesn't start a tag we use.
+function safeHtml(text) {
+  return String(text || "").replace(/<(?!\/?(?:b|i|u|s|em|strong|code|pre|a)(?:\s[^>]*)?>)/g, "&lt;");
+}
+
 async function tg(env, b, method, params) {
+  if (params && params.parse_mode === "HTML" && typeof params.text === "string") params = { ...params, text: safeHtml(params.text) };
   const r = await b.fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params) });
   return r.json();
@@ -1023,8 +1143,13 @@ async function onTelegram(env, update) {
     const rows = all.filter((r) => !want || applyMode({ apply_mode: r.apply_mode, source: r.jsource || r.source }) === want).slice(0, 5);
     if (!rows.length) return say("Nothing new right now. 🎉 New jobs come here as soon as they pass the AI check.");
     await say(`📋 <b>Newest job(s) you haven't marked:</b>`);
-    for (const r of rows) await tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: r.text, parse_mode: "HTML",
-      disable_web_page_preview: true, reply_markup: { inline_keyboard: buttons(r.uid, r.url, r.blog_url, r.source) } });
+    let sent = 0, why = "";
+    for (const r of rows) {
+      const res = await tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: r.text, parse_mode: "HTML",
+        disable_web_page_preview: true, reply_markup: { inline_keyboard: buttons(r.uid, r.url, r.blog_url, r.source) } });
+      if (res.ok) sent++; else why = String(res.description || "").slice(0, 120);
+    }
+    if (sent < rows.length) await say(`⚠️ ${rows.length - sent} of ${rows.length} jobs could not be shown: ${esc(why)}`);
   } else if (text.startsWith("/stop")) { await setState(env, "alerts_off", true); await say("🔕 Alerts paused. Send /resume to turn them back on."); }
   else if (text.startsWith("/resume") || text.startsWith("/start")) { await setState(env, "alerts_off", false); await say("🔔 Alerts are on."); }
   else if (text.startsWith("/status")) {  // where every job is right now (same as the dashboard's Pipeline tab)
@@ -1082,7 +1207,7 @@ const HELP_TEXT = "🤖 <b>FresherPilot commands</b>\n\n" +
 
 // ---------------------------------------------------------------- the minute tick
 
-const STEPS = { telegram: srcTelegram, linkedin: srcLinkedIn, careers: srcCareers, internshala: srcInternshala,
+const STEPS = { blog: srcBlog, telegram: srcTelegram, linkedin: srcLinkedIn, careers: srcCareers, internshala: srcInternshala,
                 wellfound: srcWellfound, apify: srcApify };
 
 // ---------------------------------------------------------------- pipeline status (dashboard + /status)
@@ -1138,6 +1263,17 @@ const READER_EVERY_MS = 10 * 60 * 1000;
 
 async function dispatchReader(env, b) {
   if (!READER_REPO) return;
+  // fast.yml = the target-company searches, the company career sites and a 20 s blog poke (their own workflow, own queue)
+  const lastFast = await getState(env, "gh_dispatch_fast", 0);
+  if (now() - lastFast >= READER_EVERY_MS) {
+    await setState(env, "gh_dispatch_fast", now());
+    for (const wf of ["fast.yml", "indeed.yml"]) {  // each has its own queue (concurrency group): one running + one waiting
+      await b.fetch(`https://api.github.com/repos/${READER_REPO}/actions/workflows/${wf}/dispatches`, {
+        method: "POST", body: JSON.stringify({ ref: "main" }),
+        headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "fresherpilot-cloud",
+                   "X-GitHub-Api-Version": "2022-11-28" } }).catch(() => {});
+    }
+  }
   const last = await getState(env, "gh_dispatch", 0);
   if (now() - last < READER_EVERY_MS) return;
   await setState(env, "gh_dispatch", now());
@@ -1146,6 +1282,42 @@ async function dispatchReader(env, b) {
     headers: { Authorization: `Bearer ${env.GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "fresherpilot-cloud",
                "X-GitHub-Api-Version": "2022-11-28" } });
   if (r.status !== 204) throw new Error(`GitHub dispatch HTTP ${r.status}: ${(await r.text()).slice(0, 120)}`);
+}
+
+// AI check + alerts. Called by the cron tick AND right after /api/ingest (so a job a reader just found is judged and alerted at once,
+// not at the next minute). A 45 s lock keeps the two from judging the same jobs twice.
+async function aiAndAlerts(env, b, tight) {
+  const lockAt = await getState(env, "ai_lock", 0);
+  if (now() - lockAt < 45000) return { kept: [], sent: 0 };
+  await setState(env, "ai_lock", now());
+  try {
+    // AI check + alerts (also for jobs found before the laptop came back)
+    const kept = await aiStep(env, b).catch(() => []);
+    let sent = 0;
+    for (const j of kept) {
+      if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
+      if (j.posted_days != null && j.posted_days > CONFIG.posted_within_days) continue;
+      if (alertTooOld(j)) {  // stored and rated, but not worth a Telegram alert any more
+        await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
+        continue;
+      }
+      if (await sendAlert(env, b, { uid: j.id, text: jobText(j), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
+    }
+    if (sent < MAX_ALERTS_PER_RUN && b.left > 6 && Math.floor(now() / 60000) % (tight ? 30 : 5) === 0) {
+      const missed = (await env.DB.prepare(`SELECT j.* FROM jobs j LEFT JOIN alerts a ON a.uid = j.id
+        WHERE j.status = 'keep' AND a.uid IS NULL AND j.found_at > ? ORDER BY j.found_at DESC LIMIT 6`).bind(now() - DAY).all()).results;
+      for (const j of missed) {
+        if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
+        if ((j.posted_days != null && j.posted_days > CONFIG.posted_within_days) || alertTooOld(j)) {
+          await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
+          continue;
+        }
+        const job = { ...j, facts: JSON.parse(j.facts || "{}"), fitv: JSON.parse(j.fit || "{}") };
+        if (await sendAlert(env, b, { uid: j.id, text: jobText(job), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
+      }
+    }
+  return { kept, sent };
+  } finally { await setState(env, "ai_lock", 0); }
 }
 
 async function tick(env, only = null) {
@@ -1182,34 +1354,15 @@ async function tick(env, only = null) {
       await setState(env, "src_err", bad);
     }
   }
+  // FreshersHunt blog: a tiny check every minute (the blog leads the Telegram channel by hours)
+  if (!only || only === "blog") {
+    const nb = await srcBlog(env, b).catch(async (e) => { await setState(env, "last_error", `srcBlog: ${String(e).slice(0, 200)}`); return 0; });
+    if (nb) { const ok = await getState(env, "src_ok", {}); ok.srcBlog = { at: now(), added: nb }; await setState(env, "src_ok", ok); }
+  }
   // Laptop off: start the GitHub Actions reader (LinkedIn + Indeed) every 10 min. GitHub's own schedule is
   // unreliable (Nov 5: one run in 6.5 h for "*/10"); this cron fires every minute.
   if (!only && env.GH_TOKEN) await dispatchReader(env, b).catch(async (e) => setState(env, "last_error", `reader: ${String(e).slice(0, 200)}`));
-  // AI check + alerts (also for jobs found before the laptop came back)
-  const kept = await aiStep(env, b).catch(() => []);
-  let sent = 0;
-  for (const j of kept) {
-    if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
-    if (j.posted_days != null && j.posted_days > CONFIG.posted_within_days) continue;
-    if (alertTooOld(j)) {  // stored and rated, but not worth a Telegram alert any more
-      await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
-      continue;
-    }
-    if (await sendAlert(env, b, { uid: j.id, text: jobText(j), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
-  }
-  if (sent < MAX_ALERTS_PER_RUN && b.left > 6 && Math.floor(now() / 60000) % (tight ? 30 : 5) === 0) {
-    const missed = (await env.DB.prepare(`SELECT j.* FROM jobs j LEFT JOIN alerts a ON a.uid = j.id
-      WHERE j.status = 'keep' AND a.uid IS NULL AND j.found_at > ? ORDER BY j.found_at DESC LIMIT 6`).bind(now() - DAY).all()).results;
-    for (const j of missed) {
-      if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
-      if ((j.posted_days != null && j.posted_days > CONFIG.posted_within_days) || alertTooOld(j)) {
-        await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
-        continue;
-      }
-      const job = { ...j, facts: JSON.parse(j.facts || "{}"), fitv: JSON.parse(j.fit || "{}") };
-      if (await sendAlert(env, b, { uid: j.id, text: jobText(job), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
-    }
-  }
+  const { kept, sent } = await aiAndAlerts(env, b, tight);
   // tidy up once a day (all by indexed time columns): jobs > 21 days (= KEEP_JOBS_DAYS), seen ids > 45 days (a
   // repost after that is checked again, the too_old rule drops stale ones), claims past SHOWN_FOR, alerts/actions > 30 days
   if (!only && now() - (await getState(env, "cleanup", 0)) > DAY) {
@@ -1255,20 +1408,24 @@ export default {
     const env = { ...env0, DB: metered(env0.DB) };
     try {
       await ensureIndexes(env);
-      return await route(req, env);
+      return await route(req, env, ctx);
     } finally {
       ctx.waitUntil(flushUse(env));
     }
   },
 };
 
-async function route(req, env) {
+async function route(req, env, ctx) {
   {
     const url = new URL(req.url);
     if (url.pathname === "/api/health") return json({ ok: true });
     if (url.pathname === "/app" || url.pathname.startsWith("/app/")) return handleApp(req, env, url, setState, getState, pipelineStatus);  // password dashboard
     if (url.pathname === `/tg/${env.CLOUD_SECRET}` && req.method === "POST") {
-      try { await onTelegram(env, await req.json()); } catch { /* never make Telegram retry */ }
+      try { await onTelegram(env, await req.json()); }
+      catch (e) {  // never make Telegram retry, but say what failed instead of staying silent
+        console.error("telegram command failed", String(e && e.stack || e).slice(0, 400));
+        try { await tg(env, new Budget(5), "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: "⚠️ That command failed: " + String(e && e.message || e).slice(0, 200) }); } catch { /* ignore */ }
+      }
       return json({ ok: true });
     }
     if (req.headers.get("X-FP-Secret") !== env.CLOUD_SECRET) return json({ detail: "forbidden" }, 403);
@@ -1319,7 +1476,7 @@ async function route(req, env) {
         // The reader keeps what it got and asks only for IDs added since its last round (`since`): sending the whole
         // 21-day list every ~2 min from 3 machines read >5M D1 rows a day (free limit, Nov 5).
         const since = +(url.searchParams.get("since") || 0);
-        const boards = (url.searchParams.get("boards") || "LinkedIn,Indeed").split(",").filter((x) => ["LinkedIn", "Indeed"].includes(x));
+        const boards = (url.searchParams.get("boards") || "LinkedIn,Indeed").split(",").filter((x) => ["LinkedIn", "Indeed", "Careers"].includes(x));
         for (const src of boards) {
           const rows = since
             ? (await env.DB.prepare("SELECT id FROM seen INDEXED BY seen_at WHERE at > ? AND id >= ? AND id < ?")
@@ -1328,7 +1485,7 @@ async function route(req, env) {
           known.push(...rows.map((r) => r.id));
         }
       }
-      return json({ quiet, as_of: asOf, laptop_seen: laptopSeen, read, known, li_searches: CONFIG.li_searches,
+      return json({ quiet, as_of: asOf, laptop_seen: laptopSeen, read, known, li_searches: CONFIG.li_searches, li_companies: CONFIG.li_companies || [], li_company_every_min: CONFIG.li_company_every_min || 8,
                     indeed_roles: CONFIG.indeed_roles || [], places: CONFIG.places || [],
                     posted_within_days: CONFIG.posted_within_days });
     }
@@ -1347,6 +1504,10 @@ async function route(req, env) {
       const jobs = (body.jobs || []).filter((j) => j && j.id && j.source && j.title).slice(0, 300);
       const added = await addJobs(env, jobs);
       if (body.read) await setState(env, "gh_read", { ...(await getState(env, "gh_read", {})), ...body.read });
+      if (added && ctx) ctx.waitUntil((async () => {  // judge + alert now, not at the next cron minute
+        const b = new Budget(45);
+        await aiAndAlerts(env, b, d1Tight(await d1Use(env))).catch(async (e) => setState(env, "last_error", `ingest-ai: ${String(e).slice(0, 160)}`));
+      })());
       return json({ added });
     }
     return json({ detail: "not found" }, 404);

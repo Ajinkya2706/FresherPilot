@@ -202,14 +202,14 @@ const scrolledPages = new Set(); // tabId|url already scrolled through once
 async function ready(tabId) {
   await waitForLoad(tabId);
   await inject(tabId);
-  const r = await inTab(tabId, () => window.__jfAgent.waitReady(8000));  // LinkedIn & co. never go fully quiet
+  const r = await inTab(tabId, () => window.__jfAgent.waitReady(3500, 400));  // LinkedIn & co. never go fully quiet
   // First visit to a page: scroll through it once so lazy-loaded buttons exist.
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   const key = `${tabId}|${(tab?.url || "").split("#")[0]}`;
   if (tab && !scrolledPages.has(key)) {
     scrolledPages.add(key);
     await inTab(tabId, () => window.__jfAgent.scrollThrough()).catch(() => null);
-    await inTab(tabId, () => window.__jfAgent.waitReady(5000, 500)).catch(() => null);
+    await inTab(tabId, () => window.__jfAgent.waitReady(2500, 400)).catch(() => null);
   }
   return r;
 }
@@ -305,9 +305,45 @@ async function applyWithLimit(job, settings, mode, resumeTabId = null) {
            reason: `Took over ${JOB_MAX_MS / 60000} min (stuck page?): finish it in the tab and press Continue, or Skip` };
 }
 
+// A post can ask for several things at once (Apply on the board + fill its Google Form + email the CV). The app sends
+// the emails itself; here every form link is filled AND submitted first, then the job's own page is applied to.
+async function applyWithForms(job, settings, mode) {
+  const forms = job.forms || [];
+  if (!forms.length) return applyWithLimit(job, settings, mode);
+  const notes = [];
+  let formOk = false;
+  for (const url of forms) {
+    if (ctl.stop) break;
+    let r;
+    try {
+      r = await applyWithLimit({ ...job, url, forms: [], source: "Form", review: false }, settings, mode);
+    } catch (err) {
+      r = { event: "failed", detail: String(err.message || err).slice(0, 150) };
+    }
+    if (r.stop) return r;
+    if (r.event === "applied") { formOk = true; notes.push("form submitted"); }
+    else notes.push(`form ${r.event === "parked" ? "needs you (tab left open)" : r.event}: ${(r.detail || r.reason || "").slice(0, 100)}`);
+    if (ctl.stop) break;
+  }
+  const main = ctl.stop ? { event: "skipped", detail: "stopped by you" } : await applyWithLimit(job, settings, mode);
+  if (main.event === "parked" || main.stop) return main;
+  const detail = [main.detail, ...notes].filter(Boolean).join("; ");
+  return { ...main, event: formOk && main.event === "skipped" ? "applied" : main.event, detail };
+}
+
+// Chrome refuses tab changes for a moment sometimes ("Tabs cannot be edited right now"): try again a few times.
+async function retryTabs(fn) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); } catch (err) {
+      if (i >= 5 || !/cannot be edited|dragging/i.test(String(err.message || err))) throw err;
+      await sleep(1500);
+    }
+  }
+}
+
 async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
   let tabId = resumeTabId;
-  if (!tabId) tabId = (await chrome.tabs.create({ url: fpTag(job.url, job.uid), active: mode === "single" || ["Indeed", "Internshala", "Wellfound"].includes(job.source) })).id;
+  if (!tabId) tabId = (await retryTabs(() => chrome.tabs.create({ url: job.source === "Form" ? job.url : fpTag(job.url, job.uid), active: mode === "single" || ["LinkedIn", "Indeed", "Internshala", "Wellfound", "Form"].includes(job.source) }))).id;
   const opened = [tabId];
   applyingTab[tabId] = job.uid;
   let parked = false;
@@ -321,6 +357,7 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
     let refills = 0;
     let rescanned = false;
     let reloads = 0;
+    let forced = 0;
     const history = [];
     for (let step = 0; step < (settings.max_steps || 28); step++) {
       if (token && cancelled.has(token)) { parked = true; return { event: "skipped", detail: "timed out" }; }  // set aside meanwhile
@@ -378,7 +415,7 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
           rescanned = true;
           await status(tabId, "Looking further down the page…");
           await inTab(tabId, () => window.__jfAgent.scrollThrough()).catch(() => null);
-          await inTab(tabId, () => window.__jfAgent.waitReady(8000, 500)).catch(() => null);
+          await inTab(tabId, () => window.__jfAgent.waitReady(4000, 400)).catch(() => null);
           continue;
         }
         return { event: "skipped", detail: decision.reason };
@@ -398,8 +435,11 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
         await status(tabId, "Filling the form…");
         await inTab(tabId, () => window.__jobFinderFill(false));
         filled = true;
-        await inTab(tabId, () => window.__jfAgent.waitReady(10000, 500));
-        const missing = await inTab(tabId, () => window.__jfAgent.emptyRequired());
+        await inTab(tabId, () => window.__jfAgent.waitReady(4000, 400));
+        // never stop for a question: whatever the AI left blank is answered best-effort (and invalid boxes retried)
+        await inTab(tabId, () => (window.__jfForceFill ? window.__jfForceFill() : 0)).catch(() => 0);
+        await sleep(400);
+        let missing = await inTab(tabId, () => window.__jfAgent.emptyRequired());
         if (missing?.length) {
           const reason = `Answer: ${missing.slice(0, 3).join(", ")}`;
           const n = await needsYou(tabId, job, reason, "answers", mode);
@@ -418,6 +458,14 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
         if (cmd === "stop") return { event: "skipped", detail: "stopped by you", stop: true };
         if (cmd === "skip") return { event: "skipped", detail: "form not submitted (skipped by you)" };
         return { event: "applied", detail: "form filled; submitted by you" };
+      }
+      // The same forward button pressed twice and the page didn't move on = an unanswered question: answer them all.
+      const prevClicks = history.filter((h) => h.startsWith("click"));
+      if (prevClicks.length >= 2 && prevClicks[prevClicks.length - 1] === prevClicks[prevClicks.length - 2] && forced < 8) {
+        forced++;
+        await status(tabId, "Answering the remaining questions…");
+        const n = await inTab(tabId, () => (window.__jfForceFill ? window.__jfForceFill() : 0)).catch(() => 0);
+        if (n) await sleep(500);
       }
       await status(tabId, `Pressing “${(target?.text || target?.label || decision.key).slice(0, 40)}”…`);
       await sleep(rand(decision.is_submit ? settings.before_submit : settings.step_delay));
@@ -573,7 +621,7 @@ async function runQueue(start) {
         await report("job_start", job.uid);
         let result;
         try {
-          result = await applyWithLimit(job, settings, mode);
+          result = await applyWithForms(job, settings, mode);
         } catch (err) {
           result = { event: "failed", detail: String(err.message || err).slice(0, 200) };
         }
@@ -816,6 +864,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (uid && sender.tab) { applyingTab[sender.tab.id] = uid; rememberTabJob(sender.tab.id, uid); }
         return api("/api/autofill", { method: "POST", body: JSON.stringify({ ...msg.payload, uid: uid || "" }) });
       }
+      case "jf-tgpro":  // new posts of the Freshershunt Pro channel (tgwatch.js on Telegram Web) -> the app
+        return api("/api/pro/ingest", { method: "POST", body: JSON.stringify({ messages: msg.messages }) }).catch((e) => ({ error: String(e.message || e) }));
       case "jf-resume":
         return resumeBase64();
       case "jf-fill-tab":

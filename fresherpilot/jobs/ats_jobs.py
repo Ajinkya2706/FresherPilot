@@ -153,7 +153,39 @@ def _smartrecruiters(token: str, name: str, since: datetime | None = None) -> li
     return out
 
 
-BOARDS = {"greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "smartrecruiters": _smartrecruiters}
+def _workday(token: str, name: str) -> list[dict[str, Any]]:
+    """Workday career sites (public JSON behind every myworkdayjobs.com page). token = "tenant|site|host", e.g.
+    NTT DATA = "nttlimited|NTT_Careers|wd3" (the real NTT DATA portal that the drive posts link to)."""
+    tenant, site, host = token.split("|")
+    base = f"https://{tenant}.{host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    out: list[dict[str, Any]] = []
+    for offset in (0, 20, 40):
+        r = _session.post(f"{base}/jobs", json={"appliedFacets": {}, "limit": 20, "offset": offset, "searchText": "India"},
+                          headers={"Accept": "application/json"}, timeout=TIMEOUT)
+        r.raise_for_status()
+        page = r.json().get("jobPostings") or []
+        for j in page:
+            loc = j.get("locationsText") or ""
+            if not INDIA.search(loc) and not re.match(r"\d+ Locations", loc):
+                continue
+            m = re.search(r"(\d+)\+?\s*Day", j.get("postedOn") or "")
+            days = 0 if re.search(r"Today", j.get("postedOn") or "") else 1 if re.search(r"Yesterday", j.get("postedOn") or "") else int(m.group(1)) if m else None
+            posted = None if days is None else datetime.now(timezone.utc) - timedelta(days=days)
+            path = j.get("externalPath") or ""
+            detail = (_get_json(f"{base}{path}") or {}).get("jobPostingInfo") or {}
+            where = detail.get("location") or loc
+            if re.match(r"\d+ Locations", loc) and not INDIA.search(where + " " + str(detail.get("country", {}).get("descriptor", ""))):
+                continue
+            out.append(_job(name, path.rsplit("/", 1)[-1], j.get("title", ""), where, posted,
+                            detail.get("externalUrl") or f"https://{tenant}.{host}.myworkdayjobs.com/{site}{path}",
+                            strip_html(detail.get("jobDescription") or ""), detail.get("timeType", ""), "wd"))
+        if len(page) < 20:
+            break
+    return out
+
+
+BOARDS = {"greenhouse": _greenhouse, "lever": _lever, "ashby": _ashby, "smartrecruiters": _smartrecruiters,
+          "workday": _workday}
 
 
 def fetch(hours: float) -> tuple[list[dict[str, Any]], list[str]]:

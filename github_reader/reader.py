@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -184,6 +184,81 @@ def read_linkedin(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
     return finish_li(new_cards, window), True
 
 
+def read_linkedin_companies(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
+    """One company-filtered LinkedIn search (f_C) per target company (IBM, NTT DATA, Cognizant...): their fresher jobs
+    aren't searchable on their own career pages but are listed on LinkedIn (Apply then redirects to the company page).
+    All roles of the company; the title rules and the AI judge them. Returns (jobs, complete)."""
+    companies = cfg.get("li_companies") or []
+    if SHARD in ("co0", "co1"):  # two machines: half the companies each (tier A first in both halves), a round ~35 s
+        companies = companies[int(SHARD[-1])::2]
+    if not companies:
+        return [], True
+    last = (cfg["read"] or {}).get(co_key())
+    window, _ = window_for(last, cfg["laptop_seen"], cfg["posted_within_days"])
+    window = min(window, 86400)  # a long gap: the last day is enough (the rest is old news for a fresher drive)
+    pages = 3 if window <= 3600 else min(10, 3 + window // 3600)
+    new_cards: dict[str, dict] = {}
+    began = time.time()
+    for name, cid in companies:
+        if time.time() > DEADLINE or time.time() - began > 420:  # never hold up this machine's regular rounds for long
+            return finish_li(new_cards, window), False  # not complete: the read time isn't advanced, known IDs are skipped next time
+        params = {"f_C": cid, "location": "India", "f_TPR": f"r{window}", "sortBy": "DD"}
+        for page in range(int(pages)):
+            r = li_get(LI_SEARCH, {**params, "start": page * 10})
+            found = li_cards(r.text) if r is not None else []
+            fresh = [c for c in found if f"LinkedIn:{c['id']}" not in known and c["id"] not in new_cards]
+            for c in fresh:
+                new_cards[c["id"]] = c
+            if len(found) < 10 or not fresh:
+                break
+    print(f"LinkedIn target companies: {len(companies)} searched, {len(new_cards)} new cards")
+    return finish_li(new_cards, window), True
+
+
+def read_careers(cfg: dict, known: set[str], skipped: set[str]) -> tuple[list[dict], bool]:
+    """Company career sites read directly (careers_src: Workday, Oracle HCM, Eightfold, Phenom, Amazon): the same openings the
+    FreshersHunt blog posts hours before Telegram. India only, last posted_within_days; jobs already known are skipped, only
+    new ones whose title passes the rules get a detail request. Returns (jobs, complete)."""
+    import careers_src
+    from concurrent.futures import ThreadPoolExecutor
+
+    since = datetime.now(timezone.utc) - timedelta(days=cfg["posted_within_days"])
+
+    def one(entry):
+        try:
+            return careers_src.list_jobs(entry, since)
+        except Exception as exc:  # noqa: BLE001 — one company (e.g. Workday maintenance) never stops the rest
+            print(f"Careers {entry[2]} ({entry[0]}): {type(exc).__name__}: {str(exc)[:80]}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(one, careers_src.COMPANIES))
+    errors = sum(1 for r in results if r is None)
+    cards = [c for r in results if r for c in r if f"Careers:{c['id']}" not in known and c["id"] not in skipped]
+    if not cards:
+        return [], errors < len(results)
+    keep = cloud("/api/titles", {"titles": [c["title"] for c in cards]})["keep"]
+    skipped.update(c["id"] for c, k in zip(cards, keep) if not k)  # title rules say no: not asked again this run
+    passing = [c for c, k in zip(cards, keep) if k]
+    print(f"Careers: {len(cards)} new cards, {len(passing)} pass the title rules ({errors} companies failed)")
+    jobs = []
+    for c in passing[:MAX_DETAILS]:
+        careers_src.detail(c)
+        try:
+            posted_dt = datetime.fromisoformat(c["posted"]) if c.get("posted") else None
+        except ValueError:
+            posted_dt = None
+        jobs.append({"id": c["id"], "source": "Careers", "title": c["title"], "company": c["company"], "location": c["location"],
+                     "experience": "Not specified", "posted": c.get("posted", "")[:10], "posted_days": days_ago(posted_dt),
+                     "url": c["url"], "description": c.get("description", ""), "work_type": c.get("work_type", ""),
+                     "apply_mode": "site"})
+    return jobs, errors < len(results)
+
+
+def co_key() -> str:
+    return "linkedin_co" if SHARD == "all" else f"linkedin_{SHARD}"
+
+
 def li_key() -> str:
     return "linkedin" if SHARD == "all" else f"linkedin_{SHARD}"
 
@@ -210,8 +285,12 @@ def read_indeed(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
     hours = max(1, int(window / 3600 + 0.999))
     jobs: dict[str, dict] = {}
     errors = 0
-    for role in cfg["indeed_roles"]:
-        for place in cfg["places"]:
+    # the role x place searches, then (Nov 14) one search per target company: Indeed's text search on the company name returns its
+    # own jobs whatever the title; only rows whose company matches are kept
+    searches = [(role, place, None) for role in cfg["indeed_roles"] for place in cfg["places"]]
+    searches += [(name, "India", re.sub(r"[^a-z0-9 ]", "", name.lower()).split()[0]) for name, _cid in (cfg.get("li_companies") or [])]
+    for role, place, only_company in searches:
+        if True:
             if time.time() > DEADLINE:
                 return list(jobs.values()), False
             try:
@@ -225,6 +304,8 @@ def read_indeed(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
             for row in df.to_dict("records"):
                 jid = str(row.get("id") or "").removeprefix("in-")
                 if not jid or jid in jobs or f"Indeed:{jid}" in known or not row.get("title"):
+                    continue
+                if only_company and only_company not in re.sub(r"[^a-z0-9 ]", "", str(row.get("company") or "").lower()):
                     continue
                 p = row.get("date_posted")
                 pdt = datetime(p.year, p.month, p.day, tzinfo=timezone.utc) if hasattr(p, "year") else None
@@ -248,21 +329,40 @@ def read_indeed(cfg: dict, known: set[str]) -> tuple[list[dict], bool]:
     if items:
         keep = cloud("/api/titles", {"titles": [j["title"] for j in items]})["keep"]
         items = [j for j, k in zip(items, keep) if k]
-    return items, errors < len(cfg["indeed_roles"]) * len(cfg["places"])
+    return items, errors < len(searches)
+
+
+def blog_poker() -> None:
+    """The FreshersHunt blog check runs in the cloud every minute (cron); this machine asks for it every 20 s as well, so a drive
+    published on the blog is found within ~20 s (and judged + alerted at once). Errors are ignored: the cron still runs."""
+    while time.time() < DEADLINE:
+        try:
+            requests.post(CLOUD + "/api/tick?step=blog", json={}, headers=HEAD, timeout=60)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(20)
 
 
 def main() -> int:
     force = "?force=1" if os.getenv("FP_FORCE") == "1" else ""
     do_li, do_indeed = SHARD in ("all", "li0", "li1"), SHARD in ("all", "indeed")
+    if SHARD == "careers":
+        import threading
+        threading.Thread(target=blog_poker, daemon=True).start()
+    do_car = SHARD in ("all", "careers")  # company career sites: their own machine loops them back to back
+    last_car = 0.0
+    skipped_car: set[str] = set()
+    do_co = SHARD in ("all", "co0", "co1")  # target-company searches: their own machines loop them back to back
     indeed_every = 0 if SHARD == "indeed" else INDEED_EVERY  # its own machine: back to back
     last_indeed = 0.0
+    last_co = 0.0  # target-company LinkedIn searches: every li_company_every_min, on one machine only
     rounds = 0
     known: set[str] = set()
     as_of = 0  # cloud time of the last known-ID list: after the first full list, only newer IDs are sent
     while time.time() < DEADLINE:
         began = time.time()
         sep = "&" if force else "?"
-        boards = ",".join(b for b, on in (("LinkedIn", do_li), ("Indeed", do_indeed)) if on)
+        boards = ",".join(b for b, on in (("LinkedIn", do_li or do_co), ("Indeed", do_indeed), ("Careers", do_car)) if on)
         try:  # settings, the known IDs of this machine's boards (after the first round: only new ones), read times
             cfg = cloud("/api/reader" + force + f"{sep}boards={boards}" + (f"&since={as_of}" if as_of else ""))
         except CloudDown as exc:
@@ -292,6 +392,28 @@ def main() -> int:
                 print(f"{exc}: ending this run")
                 return 0
             line += f" LinkedIn sent {len(li)} (new {res['added']})"
+        if do_co and (SHARD in ("co0", "co1") or began - last_co >= 60 * (cfg.get("li_company_every_min") or 8)):
+            last_co = began
+            try:
+                co, done = read_linkedin_companies(cfg, known)
+                res = cloud("/api/ingest", {"jobs": co, "read": {co_key(): began} if done else {}})
+                line += f" Companies sent {len(co)} (new {res['added']})"
+            except Blocked as exc:
+                print(exc)
+            except CloudDown as exc:
+                print(f"{exc}: ending this run")
+                return 0
+        if do_car and (SHARD == "careers" or began - last_car >= 10 * 60):
+            last_car = began
+            try:
+                cj, done = read_careers(cfg, known, skipped_car)
+                res = cloud("/api/ingest", {"jobs": cj, "read": {"careers": began} if done else {}})
+                line += f" Careers sent {len(cj)} (new {res['added']})"
+            except CloudDown as exc:
+                print(f"{exc}: ending this run")
+                return 0
+            except Exception as exc:  # noqa: BLE001
+                print(f"Careers round failed: {type(exc).__name__}: {str(exc)[:100]}")
         if do_indeed and began - last_indeed >= indeed_every:
             last_indeed = began
             ind, done = read_indeed(cfg, known)

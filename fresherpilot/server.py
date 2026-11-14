@@ -945,6 +945,23 @@ def naukri_sweep_plan() -> dict:
     return apify_jobs.naukri_sweep_plan()
 
 
+@app.post("/api/pro/ingest")
+def pro_ingest(body: dict) -> dict:
+    """New messages of the private 'Freshershunt Pro' Telegram channel, read by the extension from the owner's open
+    Telegram Web tab. Each message -> jobs (digests are split, lnkd.in links resolved to the real page), merged like
+    a live read, then AI-checked and alerted at once (openings like IBM's close within minutes)."""
+    from fresherpilot.jobs import apify_jobs, pro_channel
+
+    messages = [m for m in (body.get("messages") or [])[:80] if isinstance(m, dict)]
+    jobs = pro_channel.to_jobs(messages)
+    result = apify_jobs.merge_external(jobs, "live") if jobs else {"added": 0, "duplicates": 0, "other_city": 0}
+    print(f"[pro channel] {len(messages)} message(s) -> {len(jobs)} job(s): added {result['added']}, "
+          f"duplicates {result['duplicates']}, other city {result['other_city']}", flush=True)
+    if result["added"]:
+        _start_checker()
+    return {**result, "messages": len(messages), "jobs": len(jobs)}
+
+
 @app.post("/api/import_jobs")
 def import_jobs(body: dict) -> dict:
     """Jobs the extension read from a job board page; merged like a fetch, then AI-checked."""
@@ -1081,6 +1098,7 @@ def autofill(body: AutofillRequest) -> dict:
         "job": {"uid": visited.uid(job), "title": job["title"], "company": job.get("employer") or job.get("company"),
                 "instructions": instructions} if job else None,
         "missing_profile": applicant.missing_fields(applicant.load_profile()),
+        "links": (applicant.load_profile().get("links") or {}),
     }
 
 

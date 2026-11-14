@@ -141,7 +141,14 @@
   }
 
   function optionLabel(el) {
-    if (el.labels && el.labels.length) return textOf(el.labels[0]);
+    if (el.labels && el.labels.length && textOf(el.labels[0])) return textOf(el.labels[0]);
+    // LinkedIn's newer Easy Apply: <div><input aria-label="<the question>"><label for=id></label></div><div><p>Yes</p></div>
+    // (the label is an empty box, the option text sits in the next element, and aria-label is the question)
+    if (el.type === "radio" || el.type === "checkbox") {
+      const box = el.parentElement;
+      const sib = box && box.nextElementSibling;
+      if (sib && clean(sib.textContent) && clean(sib.textContent).length < 120) return clean(sib.textContent);
+    }
     if (el.getAttribute("aria-label")) return clean(el.getAttribute("aria-label"));
     const next = el.nextSibling;
     if (next && clean(next.textContent)) return clean(next.textContent);
@@ -479,6 +486,103 @@
 
   // ---------------------------------------------------------------- entry point
 
+  // Auto-apply "never stop" fallback. Works on the DOM of the open dialog directly (not through the AI field list):
+  //  1. every blank question gets a best-effort answer (Yes for willingness/consent/relocate, No for sponsorship /
+  //     criminal-record style, numbers for years / CTC / notice, the profile's own links for URL boxes);
+  //  2. every box LinkedIn marks invalid ("Invalid input", "Enter a decimal number larger than 0.0"...) gets the next
+  //     candidate value, so a few rounds always find one the box accepts.
+  // Returns the number of fields it changed.
+  window.__jfForceFill = async () => {
+    const NEG = /sponsor|visa|disab|convict|criminal|felony|non-?compete|terminat|fired|relative|related to|currently employed|employee of|politically|pending/i;
+    const root = document.querySelector("dialog[open]") || document;
+    const setVal = (el, v) => {
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : el.tagName === "SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
+    };
+    const labelOf = (el) => clean(el.getAttribute("aria-label") || (el.labels && el.labels[0] && el.labels[0].innerText) ||
+      (el.closest("fieldset") && el.closest("fieldset").querySelector("legend") && el.closest("fieldset").querySelector("legend").innerText) ||
+      (el.closest("div") && el.closest("div").parentElement ? el.closest("div").parentElement.innerText : "")).slice(0, 160);
+    const errorOf = (el) => {
+      const box = el.closest("div") && el.closest("div").parentElement;
+      const t = clean(box ? box.innerText : "");
+      const m = t.match(/(invalid input|enter a [^.]*|must be [^.]*|please enter [^.]*|required[^.]*|larger than [^.]*|between \d+ and \d+[^.]*)/i);
+      return el.getAttribute("aria-invalid") === "true" || /invalid|error/i.test(el.className || "") ? (m ? m[0] : "invalid") : (m && /invalid input|larger than|must be|enter a (decimal|whole|valid)/i.test(m[0]) ? m[0] : "");
+    };
+    const L = window.__jfLinks || {};
+    let n = 0;
+
+    // ---- text-like boxes
+    for (const el of root.querySelectorAll("input:not([type=hidden]):not([type=radio]):not([type=checkbox]):not([type=file]):not([type=submit]):not([type=button]), textarea")) {
+      if (el.closest("#__jf_status") || el.disabled || !el.offsetParent) continue;
+      const label = labelOf(el).toLowerCase();
+      if (/optional/.test(label) && !el.value) continue;
+      const err = errorOf(el);
+      if (el.value && !err) continue;
+      const tries = Number(el.dataset.jfTry || 0);
+      let value;
+      if (/linkedin|github|portfolio|website|\burl\b|\blink\b/.test(label)) {
+        value = /linkedin/.test(label) ? L.linkedin : /github/.test(label) ? L.github : L.portfolio;
+        if (!value || (el.value && err === "")) continue;
+      } else if (el.type === "date") {
+        value = new Date().toISOString().slice(0, 10);
+      } else if (el.type === "email" || /e-?mail/.test(label)) {
+        continue;  // prefilled by LinkedIn from the account
+      } else if (el.tagName === "TEXTAREA" || el.maxLength > 200) {
+        value = "Recent B.E. IT graduate with hands-on Python, AI/ML and backend project experience; keen to learn and contribute from day one.";
+      } else {
+        // LinkedIn's single-line questions are almost always numeric ("years", "CTC", "notice", even "last working date")
+        let cands;
+        if (/ctc|salary|compensation|lpa|stipend|expected/.test(label)) cands = /current|present|last|existing/.test(label) ? ["0", "1"] : ["400000", "4", "300000"];
+        else if (/notice|joining|available|days/.test(label)) cands = ["0", "15", "1"];
+        else cands = ["0", "1", "2", "3"];
+        if (/larger than 0|greater than 0|positive|at least 1/.test(err)) cands = cands.filter((c) => Number(c) > 0).concat(["1", "2"]);
+        const m = err.match(/between (\d+) and (\d+)/i);
+        if (m) cands = [m[1], String(Math.round((+m[1] + +m[2]) / 2)), m[2]];
+        if (/text|characters|letters|alphabet/.test(err)) cands = ["NA", "Fresher", "None"];
+        value = cands[Math.min(tries, cands.length - 1)];
+        if (tries >= cands.length) value = ["NA", "1", "0", "Yes"][tries % 4];  // last resorts
+      }
+      if (value === undefined || value === null || String(el.value) === String(value)) { el.dataset.jfTry = String(tries + 1); if (!err) continue; }
+      el.dataset.jfTry = String(tries + 1);
+      setVal(el, String(value));
+      n++;
+      await sleep(150);
+    }
+
+    // ---- dropdowns
+    for (const el of root.querySelectorAll("select")) {
+      if (el.disabled || !el.offsetParent) continue;
+      const opts = [...el.options].filter((o) => o.value && !/^(select|choose|please)/i.test(clean(o.text)));
+      const cur = el.options[el.selectedIndex];
+      if (!opts.length || (cur && cur.value && !/^(select|choose|please)/i.test(clean(cur.text)) && !errorOf(el))) continue;
+      const label = labelOf(el).toLowerCase();
+      const want = NEG.test(label) ? /^no\b/i : /^yes\b|^i (agree|accept|consent)|^agree|^accept/i;
+      const pick = opts.find((o) => want.test(clean(o.text))) || opts.find((o) => /^yes\b/i.test(clean(o.text))) ||
+        (/year|experience/.test(label) ? opts.find((o) => /^(0|less than|fresher|no experience)/i.test(clean(o.text))) : null) || opts[0];
+      setVal(el, pick.value);
+      n++;
+      await sleep(150);
+    }
+
+    // ---- radio groups with nothing chosen (LinkedIn: the input is hidden, the option text sits in the next element)
+    const groups = {};
+    root.querySelectorAll("input[type=radio]").forEach((r) => { (groups[r.name] = groups[r.name] || []).push(r); });
+    for (const g of Object.values(groups)) {
+      if (g.some((r) => r.checked)) continue;
+      const text = (r) => clean((r.labels && r.labels[0] && r.labels[0].innerText) || (r.parentElement && r.parentElement.nextElementSibling && r.parentElement.nextElementSibling.textContent) || r.getAttribute("aria-label") || r.value);
+      const q = clean(g[0].getAttribute("aria-label") || labelOf(g[0])).toLowerCase();
+      const want = NEG.test(q) ? /^no\b/i : /^yes\b|^i (agree|accept|consent)|^agree|^accept/i;
+      const pick = g.find((r) => want.test(text(r))) || g.find((r) => /^yes\b/i.test(text(r))) || g[0];
+      pick.click();
+      n++;
+      await sleep(150);
+    }
+    return n;
+  };
+
   window.__jobFinderFill = async (overwrite) => {
     const summary = { found: 0, filled: 0, review: 0, files: 0, already: 0, job: null, error: null, missing_profile: [] };
     try {
@@ -530,6 +634,7 @@
       const res = await answersPromise;
       summary.job = res.job;
       summary.missing_profile = res.missing_profile || [];
+      window.__jfLinks = res.links || window.__jfLinks || {};
       for (const a of res.answers || []) {
         const entry = registry.get(a.id);
         if (!entry) continue;

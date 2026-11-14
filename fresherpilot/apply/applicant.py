@@ -445,7 +445,11 @@ Body: plain text (no markdown, bullets or emojis), 110-170 words: greeting ("Dea
 given), one line on the role and company, 2-3 sentences matching the job's main requirements to concrete resume
 evidence (projects, tools), one line saying the resume is attached and they're available to join, sign-off with the
 candidate's full name, phone, email and LinkedIn/GitHub if present. No clichés. Subject: if a REQUIRED SUBJECT is
-given, return it exactly; otherwise "Application for <role> - <full name>"."""
+given, return it exactly; otherwise "Application for <role> - <full name>".
+If the POST'S INSTRUCTIONS ask for anything in the email (details to list such as name / college / CGPA / notice
+period / expected CTC / current location, a reference or job code, a given sentence, a format), include exactly
+those, using only PROFILE facts (say "Fresher" / "Immediate" where the profile has nothing and it fits); the post's
+format overrides the length and style above."""
 
 
 # Fill-in-the-blank parts of a subject the post asks for ("Application - Your Name", "[Position] | <Name>"...).
@@ -484,6 +488,12 @@ def application_email(job: dict[str, Any], required_subject: str = "") -> dict[s
     user = (f"PROFILE:\n{compact_profile(profile)}\n\nRESUME:\n{_resume_body()}\n\nJOB:\n{jd}\n\n"
             f"JD KEYWORDS THE RESUME SUPPORTS: {', '.join(have) or '-'}\nJD KEYWORDS NOT IN THE RESUME: {', '.join(lacking) or '-'}\n"
             f"REQUIRED SUBJECT: {required_subject or '(none)'}")
+    # The post's own wording about the email (subject, what to write or attach, code words, file names): it wins
+    # over the default style below.
+    ins = job.get("apply_instructions") or {}
+    excerpt = llm_filter._instruction_snippets(job.get("description") or "", 1800)
+    user += (f"\nPOST'S INSTRUCTIONS FOR THIS EMAIL (follow them exactly, e.g. required body lines, details to list, "
+             f"reference code, file name, what to attach):\nSummary: {ins.get('summary') or '-'}\nExcerpts: {excerpt or '-'}")
     try:
         content, _model = llm_filter._create(llm_filter._client(), [{"role": "system", "content": EMAIL_RULES},
                                                                    {"role": "user", "content": user}],

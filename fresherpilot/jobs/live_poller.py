@@ -432,7 +432,8 @@ def _internshala(s: dict[str, Any], since_h: float | None) -> list[dict[str, Any
 def _wellfound(s: dict[str, Any], since_h: float | None) -> list[dict[str, Any]]:
     from fresherpilot.jobs import free_boards
 
-    return free_boards.wellfound(list(users.prefs()["linkedin_titles"]), _places(), _known(s, "Wellfound"))
+    roles = list(dict.fromkeys(list(users.prefs()["linkedin_titles"]) + list(cfg.WELLFOUND_EXTRA_ROLES)))
+    return free_boards.wellfound(roles, _places(), _known(s, "Wellfound"))
 
 
 def _careers(s: dict[str, Any], since_h: float | None) -> list[dict[str, Any]]:

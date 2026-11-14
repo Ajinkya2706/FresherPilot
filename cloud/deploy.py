@@ -50,6 +50,8 @@ def build_config() -> dict:
     return {
         "telegram_channels": p.get("telegram_channels") or [],
         "li_searches": [list(s) for s in live_poller._li_searches()],
+        "li_companies": [list(c) for c in cfg.TARGET_COMPANIES_LI],
+        "li_company_every_min": cfg.TARGET_COMPANY_EVERY_MIN,
         # The GitHub Actions reader (github_reader/) asks for these at run time: Indeed like the laptop (all roles x places).
         "indeed_roles": list(p.get("roles") or []),
         "reader_repo": os.getenv("FP_READER_REPO", ""),  # <owner>/<repo> of github_reader/ (empty = not used)
@@ -64,6 +66,7 @@ def build_config() -> dict:
         "title_architect": cfg.TITLE_ARCHITECT,
         "title_years": cfg.TITLE_YEARS,
         "title_years_min": cfg.TITLE_YEARS_MIN,
+        "title_level": cfg.TITLE_LEVEL,
         "off_stack": p.get("off_stack") or [],
         "on_stack_words": p.get("on_stack_words") or [],
         "facts_prompt": llm_filter.SYSTEM_PROMPT,
@@ -124,7 +127,7 @@ def linkedin_input() -> dict:
 def wellfound_pages(p: dict) -> list[str]:
     places = live_poller._places()
     return [f"/role/r/{free_boards._wf_slug(r)}" if pl == "Remote" else f"/role/l/{free_boards._wf_slug(r)}/{free_boards._wf_slug(pl)}"
-            for r in p.get("linkedin_titles") or [] for pl in places]
+            for r in dict.fromkeys(list(p.get("linkedin_titles") or []) + list(cfg.WELLFOUND_EXTRA_ROLES)) for pl in places]
 
 
 def ensure_database() -> str:

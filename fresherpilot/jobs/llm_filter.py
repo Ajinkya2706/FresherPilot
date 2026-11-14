@@ -185,6 +185,37 @@ def ai_reads_years_posts(job: dict[str, Any]) -> bool:
     return len(str(job.get("description") or "")) >= 80  # nothing to read = the label decides
 
 
+
+# A deterministic check of the post's own words (Nov 14): when the AI left min_years_required empty on a post that says
+# "3+ years of experience" (Motorola, Barclays, Guidepoint, Natus), the "guess" path let it through. This reads the text.
+_YEARS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:(?:-|–|to)\s*(\d+(?:\.\d+)?))?\s*\+?\s*(?:years?|yrs?)\b", re.I)
+_YEARS_SOFT = re.compile(r"less than|up to|upto|under|below|maximum|max\.?|within|preferred|desirable|good to have|nice to have|"
+                         r"a plus|bonus|warrant|guarantee|duration|contract of|bond|service agreement|since|founded|established|"
+                         r"over the (?:last|past)|for the (?:last|past)|over|more than|collective|anniversar|history|legacy|decades?|we have|we've|\bage\b", re.I)
+EXPLICIT_YEARS_MIN = 2  # 1 year is left to the AI (the owner's reject_from_years rule); 2+ stated in the text is clear
+
+
+def explicit_years(text: str) -> float | None:
+    """Smallest 'N years' experience requirement the text states as required (>= EXPLICIT_YEARS_MIN), else None.
+    A 0-N range, "less than N", preferred/desirable and non-experience years (bond, duration) don't count."""
+    t = re.sub(r"\s+", " ", str(text or ""))
+    found: list[float] = []
+    for m in _YEARS_RE.finditer(t):
+        lo = float(m.group(1))
+        before, after = t[max(0, m.start() - 40):m.start()], t[m.end():m.end() + 60]
+        around = before + " " + after
+        if not re.search(r"experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|work(?:ing)?|in (?:a |an )?\w+ (?:role|field)|as a", around, re.I):
+            continue
+        if _YEARS_SOFT.search(before[-25:]) or re.match(r"\W{0,3}\(?\s*(?:preferred|desirable|plus|good to have|nice to have|optional)", after, re.I):
+            continue
+        if re.search(r"preferred|desirable|good to have|nice to have|bonus", before[-70:], re.I) and not re.search(r"minimum|required|must", before[-70:], re.I):
+            continue
+        if lo < EXPLICIT_YEARS_MIN or lo > 15:
+            continue
+        found.append(lo)
+    return min(found) if found else None
+
+
 def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
     """Apply the candidate's preferences to the extracted facts -> (decision, category)."""
     if facts.get("prescreen"):  # rejected before the full check (board data or title screen)
@@ -211,6 +242,10 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
         return "reject", "too_senior"
     # "Mid-Senior level" is often set wrongly by recruiters on fresher jobs: it only rejects when the
     # description doesn't say freshers are welcome or ask for less than the limit.
+    # Nov 14 (later): the "Mid-Senior" board label rejects again unless freshers are welcome or years < the limit. A short loosening earlier
+    # that day let label-only guesses through; IBM then sent experienced roles ("Application Developer-Asset Management": every IBM post
+    # but its fresher drive is "Mid-Senior"; that drive, "Associate System Engineer", is "Entry level"). Recall for such companies now
+    # comes from their direct pipelines (career site, Naukri, Indeed) which have no label to mislead.
     if re.search(r"mid-senior", level, re.I) and not (freshers or low_years):
         return "reject", "too_senior"
     if facts.get("role_type") not in ALLOWED_ROLES:
@@ -219,6 +254,9 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
         if isinstance(years, (int, float)) and years >= reject_from:
             return "reject", "needs_experience"
         if platform_min and int(platform_min.group(1)) >= reject_from:
+            return "reject", "needs_experience"
+        if (not low_years and explicit_years(job.get("description")) is not None
+                and not re.search(r"fresher|trainee|graduate|entry|junior|intern|campus|apprentice", str(job.get("title") or ""), re.I)):  # the post says "N+ years" and the AI missed it
             return "reject", "needs_experience"
     return "keep", "ok"
 
@@ -806,6 +844,9 @@ def title_excluded(title: str) -> tuple[str, str] | None:
                     return category, w.strip()
     m = re.search(cfg.TITLE_YEARS, str(title or ""), re.I)
     if m and float(m.group(1)) >= cfg.TITLE_YEARS_MIN:
+        return "needs_experience", m.group(0)
+    m = re.search(cfg.TITLE_LEVEL, str(title or ""))
+    if m:
         return "needs_experience", m.group(0)
     return None
 

@@ -46,7 +46,7 @@ _lock = threading.Lock()
 # Pacing used by the extension (seconds).
 # The extension also waits for each page to be ready (loaded, no spinners, DOM/network quiet);
 # these are only the short human-like pauses on top of that.
-SETTINGS = {"step_delay": [0.8, 2.0], "before_submit": [1.5, 3.0], "between_jobs": [20, 40], "max_steps": 28}
+SETTINGS = {"step_delay": [0.2, 0.6], "before_submit": [0.4, 0.9], "between_jobs": [0.5, 2], "max_steps": 28}
 
 
 # ---------------------------------------------------------------- queue
@@ -249,15 +249,16 @@ _NOT_FOR_CVS = re.compile(r"accommodat|accessib|disabilit|privacy|gdpr|dpo|no-?r
 _ASKS_FOR_CV = re.compile(r"resume|\bcv\b|curriculum|apply|application|send|share|mail|email|forward|drop|submit|interested", re.I)
 
 
-def _instruction_plan(job: dict[str, Any]) -> tuple[str, Any]:
-    """How to apply to a job with special instructions:
-    ("email", (addresses, subject))  the post asks to email the CV: the app sends it from your Gmail;
-    ("form", url)                    a Google / MS / Typeform form: the extension fills it, you submit;
-    ("manual", summary)              anything else (assessment, walk-in, WhatsApp...): left to you;
-    ("normal", None)                 no special instructions: the usual apply flow."""
+def _instruction_plan(job: dict[str, Any]) -> dict[str, Any]:
+    """Everything a post with special instructions asks for; ALL of it is done (they are not alternatives):
+    emails  addresses the CV must be mailed to (the app sends it from your Gmail, following the post's wording);
+    subject the required subject line, if any;
+    forms   Google / MS / Typeform links: the extension fills AND submits them;
+    manual  anything else (assessment, walk-in, WhatsApp...): shown, left to you."""
+    plan: dict[str, Any] = {"emails": [], "subject": "", "forms": [], "manual": ""}
     ins = job.get("apply_instructions") or {}
     if not ins:
-        return "normal", None
+        return plan
     text = f"{job.get('description') or ''}\n{ins.get('summary') or ''}"
     # Only addresses that are really in the post (never one the AI made up), real inboxes only
     from fresherpilot.outreach import messages
@@ -266,13 +267,16 @@ def _instruction_plan(job: dict[str, Any]) -> tuple[str, Any]:
     emails = [e.strip().lower() for e in ins.get("emails") or [] if e and e.strip().lower() in low
               and messages._email_ok(e.strip().lower()) and not _NOT_FOR_CVS.search(e.split("@")[0])
               and _ASKS_FOR_CV.search(low[max(0, low.find(e.strip().lower()) - 160): low.find(e.strip().lower()) + 80])]
-    forms = [u for u in ins.get("links") or [] if _FORM.search(u or "")]
-    if emails:
-        return "email", (emails[:2], (ins.get("subject_line") or "").strip())
-    if forms:
-        url = forms[0] if forms[0].startswith("http") else f"https://{forms[0]}"
-        return "form", url
-    return "manual", ins.get("summary") or "special instructions"
+    forms = []
+    for u in ins.get("links") or []:
+        if _FORM.search(u or ""):
+            u = u if u.startswith("http") else f"https://{u}"
+            if u not in forms:
+                forms.append(u)
+    plan.update(emails=emails[:2], subject=(ins.get("subject_line") or "").strip(), forms=forms[:3])
+    if not emails and not forms:
+        plan["manual"] = ins.get("summary") or "special instructions"
+    return plan
 
 
 def _send_application_emails(jobs: list[tuple[dict[str, Any], list[str], str]], finish: bool = False) -> None:
@@ -322,7 +326,10 @@ def _easy_first(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # once (~2.5 s each, LinkedIn's guest pace, free), saves the tag, and leaves out jobs that are closed or removed.
 TAG: dict[str, Any] = {"running": False, "done": 0, "total": 0, "easy": 0, "site": 0, "closed": 0, "started": None,
                        "finished": None, "error": None}
+_LI_LIMIT = re.compile(r"reached (?:today.?s|the daily|your daily)[^.]{0,30}Easy Apply limit|Easy Apply (?:daily )?limit", re.I)
 _CLOSED_LI = re.compile(r"no longer accepting applications", re.I)
+_CLOSED_PAGE = re.compile(r"no longer accepting applications|not currently accepting applications|"
+                          r"this job (?:is )?(?:no longer available|has expired|is closed)|applications? (?:for this job )?(?:are|is) closed", re.I)
 
 
 def tag_status() -> dict[str, Any]:
@@ -439,20 +446,19 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
     for j in jobs:
         item = {"uid": j["uid"], "url": j["url"], "title": j["title"], "company": j.get("employer") or j.get("company"),
                 "source": j.get("source"), "jd_keys": _jd_keys(j)}
-        kind, info = _instruction_plan(j)
-        if kind == "email":  # apply on the job site AND send the email the post asks for
+        plan = _instruction_plan(j)
+        parts = []
+        if plan["emails"]:  # the email the post asks for (sent by the app)...
             if j["uid"] not in done_email:
-                emails.append((j, info[0], info[1]))
-            item["kind"] = "email+site"
-            browser.append(item)
-        elif kind == "form":  # fill the form the post points to; the user checks it and submits
-            item.update(kind="form", url=info, review=True)
-            browser.append(item)
-        elif kind == "manual":  # e.g. "apply only on the official site": that's the job link; the extension
-            item["note"] = str(info)[:200]  # sets the job aside in "Waiting for you" if it really needs you
-            browser.append(item)
-        else:  # no instructions, or one job the user asked for: the usual flow on the job page
-            browser.append(item)
+                emails.append((j, plan["emails"], plan["subject"]))
+            parts.append("email")
+        if plan["forms"]:  # ...the form(s) it links (filled AND submitted by the extension)...
+            item["forms"] = plan["forms"]
+            parts.append("form")
+        if plan["manual"]:  # e.g. "apply only on the official site": that's the job link; the extension
+            item["note"] = str(plan["manual"])[:200]  # sets the job aside in "Waiting for you" if it really needs you
+        item["kind"] = "+".join(parts + ["site"]) if parts else "site"  # ...and always the job's own page
+        browser.append(item)
         queue.append(item)
     with _lock:
         STATE.update(running=True, mode="single" if single else "bulk", queue=queue, total=len(queue), index=0,
@@ -710,7 +716,7 @@ LOGIN_URL = re.compile(r"/login|/authwall|nlogin|secure\.indeed\.com/auth|/signi
 ALREADY_BTN = re.compile(r"^(?:✓\s*)?(?:already\s+)?applied(?:\s*✓)?(?:\s+\d+\s*\w+\s+ago|\s+on\s+.{1,15})?$"
                          r"|^application\s+(?:already\s+)?(?:sent|submitted)$", re.I)
 ALREADY_TEXT = re.compile(r"you(?:'ve| have) already applied|already applied (?:to|for) this|you applied \d+\s*\w+ ago|"
-                          r"applied on \d{1,2}[ /-]\w{2,9}|application (?:already )?(?:sent|submitted) on|"
+                          r"applied on \d{1,2}[ /-]\w{2,9}|application (?:already )?(?:sent|submitted) on|application submitted\s+\d+\s*\w+\s+ago|"
                           r"\bapplied\s+\d+\s*(?:minute|hour|day|week|month)s? ago", re.I)
 
 
@@ -728,7 +734,8 @@ _FORWARD_RANK = [  # when a step offers several forward buttons, the furthest on
     re.compile(r"^review( (your )?application)?$", re.I),
     re.compile(r"^(next|continue|continue to next step|save and continue)$", re.I),
 ]
-_SENT = re.compile(r"application sent|applied successfully|successfully applied|your application (has been |was )?sent|"
+_SENT = re.compile(r"application sent|your response (has been |was )?(recorded|submitted)|response (has been |was )?recorded|"
+                   r"thanks for (submitting|filling)|form (was |has been )?submitted|applied successfully|successfully applied|your application (has been |was )?sent|"
                    r"you('ve| have) applied", re.I)
 
 
@@ -838,6 +845,15 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
     filled, submitted = bool(body.get("filled")), bool(body.get("submitted"))
     history = body.get("history") or []
 
+    # LinkedIn caps Easy Apply submissions per day ("You reached today's Easy Apply limit"): nothing more goes through
+    # until tomorrow. Remember it for 14 h and skip every further LinkedIn job at once (not "never again": retry later).
+    job_src = (body.get("job") or {}).get("source", "")
+    if job_src == "LinkedIn":
+        if _LI_LIMIT.search(full[:4000] + " " + text):
+            STATE["li_limit_at"] = time.time()
+        if time.time() - float(STATE.get("li_limit_at") or 0) < 14 * 3600:
+            return {"action": "skip", "key": "", "reason": "LinkedIn Easy Apply daily limit reached: will retry tomorrow"}
+
     # Code-level checks first (cheap and reliable).
     if submitted and CONFIRMED.search(full):
         return {"action": "done", "key": "", "reason": "confirmation shown after submit"}
@@ -869,6 +885,11 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
         labels = [(it.get("text") or it.get("label") or "").strip() for it in items if it.get("tag") != "a"]
         if any(ALREADY_BTN.match(x) for x in labels) or ALREADY_TEXT.search(full) or snap.get("already"):
             return {"action": "skip", "key": "", "reason": "already applied to this job earlier"}
+
+    # Closed job (Nov 13: 12 LinkedIn jobs showing "No longer accepting applications" made the playbook click an
+    # Easy Apply button of a sidebar job 14 times each): skip at once, free, and never try it again.
+    if not submitted and not filled and not snap.get("dialog") and _CLOSED_PAGE.search(full[:2500] + " " + str(snap.get("text", ""))[:1500]):
+        return {"action": "skip", "key": "", "reason": "Job posting is no longer accepting applications (page says so)"}
 
     # Site playbooks (Nov 12): these boards' quick-apply flows are fixed templates, so the usual steps need no AI
     # call (each one cost ~2-15 s). Anything unusual still falls through to the AI below.

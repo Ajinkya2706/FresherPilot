@@ -93,7 +93,9 @@
     // A real dialog element first (LinkedIn's Easy Apply is a <dialog>): a looser "modal"-named element inside it
     // must not be taken for the dialog, or the footer's Next / Submit buttons count as outside it.
     // (an empty wrapper, e.g. Wellfound's, is skipped: the form lives in a sibling modal found below)
-    const real = [...document.querySelectorAll("dialog[open],[role=dialog],[aria-modal=true],[data-testid=dialog]")].filter((e) => visible(e) && clean(e.innerText).length > 0);
+    // (opacity is ignored: in a background tab the fade-in never finishes and LinkedIn's dialog stays at opacity 0)
+    const boxed = (e) => { const r = e.getBoundingClientRect(), s = getComputedStyle(e); return r.width > 2 && r.height > 2 && s.visibility !== "hidden" && s.display !== "none" && r.bottom > 0 && r.top < innerHeight * 1.6; };
+    const real = [...document.querySelectorAll("dialog[open],[role=dialog],[aria-modal=true],[data-testid=dialog]")].filter((e) => boxed(e) && clean(e.innerText).length > 0);
     if (real.length) return real[real.length - 1];
     const dialogs = [...document.querySelectorAll(".artdeco-modal,[class*=modal],[class*=Drawer]")].filter(visible);
     return dialogs[dialogs.length - 1] || null;
@@ -130,7 +132,7 @@
       });
     });
     const root = dialog || document.body;
-    const fields = [...root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]),select,textarea")].filter((f) => rendered(f) && !f.closest("#__jf_status"));
+    const fields = [...root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]),select,textarea")].filter((f) => (rendered(f) || ((f.type === "radio" || f.type === "checkbox") && f.labels && [...f.labels].some(rendered))) && !f.closest("#__jf_status"));  // LinkedIn hides the radio input itself, only its label shows
     const empty = fields.filter((f) => (f.type === "radio" || f.type === "checkbox" ? false : !clean(f.value))).length;
     // "Applied" shown as a plain span/div (Naukri, LinkedIn "Applied 2d ago"), not a button the list above would hold.
     const already = !dialog && [...document.querySelectorAll("button,div,span,a,p")].some((e) => {

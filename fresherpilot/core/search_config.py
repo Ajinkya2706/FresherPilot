@@ -71,10 +71,20 @@ NAUKRI_EXPERIENCE_PASSES = ["0", "1"]
 NAUKRI_SKIP_TERMS = {"graduate engineer trainee", "generative ai engineer"}
 
 
+# Nov 14: a dedicated Naukri search per target company (Naukri's text search on the company name returns that company's own jobs and
+# the "hiring for <company>" agency posts, whatever the job title). Own "incremental" state (stateKey ...-companies): only new jobs are
+# charged. Naukri blocks direct requests (reCAPTCHA), so this runs on Apify like the role search.
+NAUKRI_COMPANY_TERMS = ["IBM", "NTT DATA", "Cognizant", "Capgemini", "Accenture", "Infosys", "Wipro", "HCLTech", "Tech Mahindra",
+                        "LTIMindtree", "Mphasis", "Coforge", "Hexaware", "Birlasoft", "Zensar", "Genpact", "DXC Technology",
+                        "Persistent Systems", "Sonata Software", "Cyient", "KPIT", "Deloitte", "TCS", "Kyndryl", "CGI"]
+
+
 def naukri_groups(roles: list[str]) -> list[tuple[str, list[str], str | None]]:
-    """[(group name, search terms, roleCategory or None)] for the Naukri runs (one group: no category filter)."""
+    """[(group name, search terms, roleCategory or None)] for the Naukri runs: the role search, then the company search."""
     terms = [r for r in roles if r.lower() not in NAUKRI_SKIP_TERMS]
-    return [("clean", terms, None)] if terms else []
+    groups: list[tuple[str, list[str], str | None]] = [("clean", terms, None)] if terms else []
+    groups.append(("companies", list(NAUKRI_COMPANY_TERMS), None))
+    return groups
 
 
 def naukri_passes(prefs: dict) -> list[str]:
@@ -87,6 +97,43 @@ def naukri_passes(prefs: dict) -> list[str]:
 _LI_SECONDS = POSTED_WITHIN_DAYS * 24 * 3600
 # Most valuable first: searches run in this order while the daily budget lasts. Each title is its
 # own search: one combined "A OR B" search returned only ~300 jobs a day vs ~585 for "AI Engineer" alone.
+# Companies whose fresher jobs can't be found on their own career pages (IBM, NTT DATA, Cognizant: JS apps / links only,
+# docs/TARGET_COMPANIES.md) but ARE listed on LinkedIn, whose Apply button then redirects to the company page.
+# One company-filtered LinkedIn search each (f_C = LinkedIn company id, from the guest typeahead), every
+# TARGET_COMPANY_EVERY_MIN minutes, all roles (the title rules + AI judge them). Tier A first, then tier B.
+TARGET_COMPANIES_LI = [
+    ("IBM", 1009),
+    ("NTT DATA", 18535),
+    ("Cognizant", 1680),
+    ("Capgemini", 157240),
+    ("Accenture", 1033),
+    ("Infosys", 1283),
+    ("Wipro", 1318),
+    ("HCLTech", 1756),
+    ("Tech Mahindra", 3067),
+    ("LTIMindtree", 86813252),
+    ("Mphasis", 3586),
+    ("Coforge", 31537981),
+    ("Hexaware Technologies", 164182),
+    ("Birlasoft", 4661),
+    ("Zensar Technologies", 4897),
+    ("CGI", 1415),
+    ("Genpact", 210064),
+    ("DXC Technology", 16198010),
+    ("Persistent Systems", 5034),
+    ("Sonata Software", 6005),
+    ("Cyient", 164361),
+    ("KPIT", 5521),
+    ("Deloitte", 1038),
+    ("Tata Consultancy Services", 1353),
+    ("Kyndryl", 73002693),
+]
+TARGET_COMPANY_EVERY_MIN = 8
+
+# Wellfound files jobs under its own role names. "AI / Machine Learning" jobs (Hyderabad, Nov 6) were only on
+# /role/l/artificial-intelligence-engineer/..., a page nobody read, because Wellfound pages came from LINKEDIN_TITLES.
+WELLFOUND_EXTRA_ROLES = ["Artificial Intelligence Engineer"]
+
 LINKEDIN_TITLES = [
     "AI Engineer", "Machine Learning Engineer", "Data Scientist",
     "Python Developer", "Backend Developer", "Software Engineer",
@@ -116,6 +163,9 @@ TITLE_ARCHITECT = r"(?<![a-z])architects?(?![a-z])"
 # "AI Engineer (3-5 yrs)": 2+ years in the title (1-year titles go to the AI: some welcome freshers).
 TITLE_YEARS = r"(\d+(?:\.\d+)?)\s*(?:\+\s*)?(?:(?:-|–|to)\s*\d+\s*)?(?:yrs|years|year|yr)\b"
 TITLE_YEARS_MIN = 2
+# Level codes in the title (Wipro "DEVELOPER L3", Cognizant "... L2"): L1 = fresher grade, L3 and above = experienced (Nov 14:
+# Wipro "DEVELOPER L3/L4" got alerts; back-test: 72 cached jobs with L3-L9, 0 approved, 0 applied).
+TITLE_LEVEL = r"(?<![A-Za-z0-9])L([3-9])(?![A-Za-z0-9+])"
 
 TITLE_EXCLUDE = {
     "too_senior": ["senior", "sr.", "sr ", "lead ", "team lead", "tech lead", "principal", "staff engineer", "staff software",
@@ -310,6 +360,10 @@ CAREER_PAGES = [
     ("smartrecruiters", "Continental", "Continental"),
     ("smartrecruiters", "WesternDigital", "Western Digital"),
     ("smartrecruiters", "Ubisoft2", "Ubisoft"),
+    # Mass fresher hirers with a real assessment + interview process (see docs/TARGET_COMPANIES.md). Workday token =
+    # "tenant|site|host" (NTT DATA's portal: nttlimited.wd3.myworkdayjobs.com/NTT_Careers, measured Nov 13: 261 India jobs,
+    # real "Posted Today" dates). Capgemini's own feed was measured too: 691 of 720 jobs "Experienced", not useful.
+    ("workday", "nttlimited|NTT_Careers|wd3", "NTT DATA"),
 ]
 
 
