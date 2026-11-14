@@ -167,28 +167,37 @@ function decide(f, job) {  // llm_filter.decide
   if (!["entry", "unclear"].includes(f.seniority) && !guess && !(f.seniority === "mid" && (freshers || low))) return ["reject", "too_senior"];
   if (/director|executive/i.test(level)) return ["reject", "too_senior"];
   // Nov 14 (later): "Mid-Senior" rejects unless freshers are welcome or years < the limit (llm_filter.decide: IBM sent experienced roles)
-  if (/mid-senior/i.test(level) && !(freshers || low)) return ["reject", "too_senior"];
+  const freshOk = freshers && (String(f.experience_evidence || "").trim() || FRESH_TEXT.test(String(job.description || "")) || FRESH_TITLE.test(String(job.title || "")));
+  if (/mid-senior/i.test(level) && !(freshOk || low)) return ["reject", "too_senior"];
   if (!ALLOWED_ROLES.has(f.role_type)) return ["reject", f.role_type === "non_software_engineering" ? "non_software_engineering" : "non_developer"];
+  const ey = /^\s*0(?:\.\d+)?\s*(?:-|\u2013|to)\s*\d/.test(level) ? null : explicitYears(job.description);
+  if (ey !== null && !FRESH_TEXT.test(String(job.description || "")) && !FRESH_TITLE.test(String(job.title || "")) &&
+      !(freshers && String(f.experience_evidence || "").trim())) return ["reject", "needs_experience"];  // the text states 2+ years, nothing welcomes freshers
   if (!freshers) {
     if (typeof years === "number" && years >= rf) return ["reject", "needs_experience"];
     if (platformMin && parseInt(platformMin[1], 10) >= rf) return ["reject", "needs_experience"];
     // the post says "N+ years" and the AI missed it (llm_filter.explicit_years); fresher-titled posts are left to the AI
-    if (!low && explicitYears(job.description) !== null && !/fresher|trainee|graduate|entry|junior|intern|campus|apprentice/i.test(String(job.title || ""))) return ["reject", "needs_experience"];
+    if (!low && ey !== null && !/fresher|trainee|graduate|entry|junior|intern|campus|apprentice/i.test(String(job.title || ""))) return ["reject", "needs_experience"];
   }
   return ["keep", "ok"];
 }
 
 const YEARS_RE = /(\d+(?:\.\d+)?)\s*\+?\s*(?:(?:-|–|to)\s*(\d+(?:\.\d+)?))?\s*\+?\s*(?:years?|yrs?)\b/gi;
 const YEARS_SOFT = /less than|up to|upto|under|below|maximum|max\.?|within|preferred|desirable|good to have|nice to have|a plus|bonus|warrant|guarantee|duration|contract of|bond|service agreement|since|founded|established|over the (?:last|past)|for the (?:last|past)|over|more than|collective|anniversar|history|legacy|decades?|we have|we've|\bage\b/i;
+// llm_filter.has_fresher_text: "freshers_welcome" is trusted only when the post's own words show it (PMGlide FDE: AI said fresh with no evidence, text said 5+ years)
+const FRESH_TEXT = /fresher|fresh graduate|new grad|recent graduates?|0\s*(?:-|\u2013|to)\s*[12](?:\.\d)?\+?\s*(?:years|yrs|year)|no (?:prior |previous |relevant )?experience|experience (?:is )?(?:not|isn.t) (?:required|necessary|needed)|entry[- ]level|campus|trainee|graduate engineer|early career|class of 20|20\d\d (?:batch|graduates?|grads)|(?:batch|passing out|pass[- ]?out) (?:of )?20\d\d|year of (?:graduation|passing)|0 experience/i;
+const FRESH_TITLE = /fresher|trainee|graduate|entry|junior|intern|campus|apprentice|early career/i;
 function explicitYears(text) {  // llm_filter.explicit_years: smallest "N years" experience the text requires (>= 2), else null
   const t = String(text || "").replace(/\s+/g, " ");
   const found = [];
   for (const m of t.matchAll(YEARS_RE)) {
-    const lo = parseFloat(m[1]);
+    let lo = parseFloat(m[1]);
     const before = t.slice(Math.max(0, m.index - 40), m.index), after = t.slice(m.index + m[0].length, m.index + m[0].length + 60);
-    if (!/experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|work(?:ing)?|in (?:a |an )?\w+ (?:role|field)|as a/i.test(before + " " + after)) continue;
+    if (!/experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|in (?:a |an )?\w+ (?:role|field)|as a/i.test(before + " " + after)) continue;
     if (YEARS_SOFT.test(before.slice(-25)) || /^\W{0,3}\(?\s*(?:preferred|desirable|plus|good to have|nice to have|optional)/i.test(after)) continue;
     if (/preferred|desirable|good to have|nice to have|bonus/i.test(before.slice(-70)) && !/minimum|required|must/i.test(before.slice(-70))) continue;
+    const pre = before.match(/(\d+(?:\.\d+)?)\s*(months?|mos?)?\s*(?:-|\u2013|to)?\s*$/i);  // a range with a lost dash: the lower bound counts
+    if (pre) { const low = parseFloat(pre[1]) / (pre[2] ? 12 : 1); if (low < lo) lo = low; }
     if (lo < 2 || lo > 15) continue;
     found.push(lo);
   }

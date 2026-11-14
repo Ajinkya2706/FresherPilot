@@ -204,16 +204,35 @@ def explicit_years(text: str) -> float | None:
         lo = float(m.group(1))
         before, after = t[max(0, m.start() - 40):m.start()], t[m.end():m.end() + 60]
         around = before + " " + after
-        if not re.search(r"experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|work(?:ing)?|in (?:a |an )?\w+ (?:role|field)|as a", around, re.I):
+        if not re.search(r"experience|exp\b|at least|atleast|minimum|required|requires|hands.?on|professional|industry|relevant|in (?:a |an )?\w+ (?:role|field)|as a", around, re.I):
             continue
         if _YEARS_SOFT.search(before[-25:]) or re.match(r"\W{0,3}\(?\s*(?:preferred|desirable|plus|good to have|nice to have|optional)", after, re.I):
             continue
         if re.search(r"preferred|desirable|good to have|nice to have|bonus", before[-70:], re.I) and not re.search(r"minimum|required|must", before[-70:], re.I):
             continue
+        pre = re.search(r"(\d+(?:\.\d+)?)\s*(months?|mos?)?\s*(?:-|\u2013|to)?\s*$", before, re.I)
+        if pre:  # a range with a lost dash: the lower bound is what's required
+            low = float(pre.group(1)) / (12 if pre.group(2) else 1)
+            if low < lo:
+                lo = low
         if lo < EXPLICIT_YEARS_MIN or lo > 15:
             continue
         found.append(lo)
     return min(found) if found else None
+
+
+# Nov 14: "freshers_welcome" is only trusted when the post's own words show it. PMGlide "Forward Deployed Engineer, Generative AI" (LinkedIn level
+# "Entry level", text "5+ years of software development experience", Masters only preferred) got fresh=true with no quoted evidence and
+# skipped every years rule. A post that states 2+ years and has no fresher wording is rejected whatever the AI says.
+_FRESH_TEXT = re.compile(r"fresher|fresh graduate|new grad|recent graduate|recent graduates|0\s*(?:-|\u2013|to)\s*[12](?:\.\d)?\+?\s*(?:years|yrs|year)|"
+                         r"no (?:prior |previous |relevant )?experience|experience (?:is )?(?:not|isn.t) (?:required|necessary|needed)|"
+                         r"entry[- ]level|campus|trainee|graduate engineer|early career|class of 20|20\d\d (?:batch|graduates?|grads)|"
+                         r"(?:batch|passing out|pass[- ]?out) (?:of )?20\d\d|year of (?:graduation|passing)|0 experience", re.I)
+_FRESH_TITLE = r"fresher|trainee|graduate|entry|junior|intern|campus|apprentice|early career"
+
+
+def has_fresher_text(text: str) -> bool:
+    return bool(_FRESH_TEXT.search(str(text or "")))
 
 
 def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
@@ -246,16 +265,22 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
     # that day let label-only guesses through; IBM then sent experienced roles ("Application Developer-Asset Management": every IBM post
     # but its fresher drive is "Mid-Senior"; that drive, "Associate System Engineer", is "Entry level"). Recall for such companies now
     # comes from their direct pipelines (career site, Naukri, Indeed) which have no label to mislead.
-    if re.search(r"mid-senior", level, re.I) and not (freshers or low_years):
+    fresh_ok = freshers and bool(str(facts.get("experience_evidence") or "").strip() or has_fresher_text(job.get("description"))
+                                 or re.search(_FRESH_TITLE, str(job.get("title") or ""), re.I))  # "fresh" with no support in the post is a guess
+    if re.search(r"mid-senior", level, re.I) and not (fresh_ok or low_years):
         return "reject", "too_senior"
     if facts.get("role_type") not in ALLOWED_ROLES:
         return "reject", "non_software_engineering" if facts.get("role_type") == "non_software_engineering" else "non_developer"
+    ey = None if re.match(r"\s*0(?:\.\d+)?\s*(?:-|\u2013|to)\s*\d", level) else explicit_years(job.get("description"))
+    if (ey is not None and not has_fresher_text(job.get("description")) and not re.search(_FRESH_TITLE, str(job.get("title") or ""), re.I)
+            and not (freshers and str(facts.get("experience_evidence") or "").strip())):
+        return "reject", "needs_experience"  # the text states 2+ years and nothing in it welcomes freshers (the AI's "freshers welcome" is unsupported)
     if not freshers:
         if isinstance(years, (int, float)) and years >= reject_from:
             return "reject", "needs_experience"
         if platform_min and int(platform_min.group(1)) >= reject_from:
             return "reject", "needs_experience"
-        if (not low_years and explicit_years(job.get("description")) is not None
+        if (not low_years and ey is not None
                 and not re.search(r"fresher|trainee|graduate|entry|junior|intern|campus|apprentice", str(job.get("title") or ""), re.I)):  # the post says "N+ years" and the AI missed it
             return "reject", "needs_experience"
     return "keep", "ok"
