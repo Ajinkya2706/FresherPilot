@@ -679,9 +679,9 @@ def in_wanted_location(job: dict[str, Any]) -> bool:
     """Free check of a job's location text against the user's cities (catches what a board's own
     location search let through, and the free career pages). Unknown / "India"-only locations stay."""
     cities, remote = _locations()
-    if not cities and not remote:
-        return True
     loc = str(job.get("location") or "").lower()
+    if not cities and not remote:  # anywhere in India: only drop clearly foreign places
+        return not (_FOREIGN.search(loc) and "india" not in loc)
     if not loc.strip() or loc.strip(" ,") in ("india", "in"):
         return True
     words = {w for c in cities for w in cfg.CITY_ALIASES.get(c.lower(), [c.lower()])}

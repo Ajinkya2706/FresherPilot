@@ -16,6 +16,7 @@ const CATEGORY_LABELS = {
   internship: "Internship",
   not_full_time: "Not full-time",
   too_senior: "Too senior",
+  needs_postgrad: "Needs Master's/PhD",
   needs_experience: "Needs 1+ years",
   non_developer: "Not a developer role",
   non_software_engineering: "Non-software engineering",

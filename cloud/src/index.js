@@ -171,6 +171,7 @@ function decide(f, job) {  // llm_filter.decide
   // Nov 14 (later): "Mid-Senior" rejects unless freshers are welcome or years < the limit (llm_filter.decide: IBM sent experienced roles)
   const freshOk = freshers && (String(f.experience_evidence || "").trim() || FRESH_TEXT.test(String(job.description || "")) || FRESH_TITLE.test(String(job.title || "")));
   if (/mid-senior/i.test(level) && !(freshOk || low)) return ["reject", "too_senior"];
+  if (f.needs_postgrad) return ["reject", "needs_postgrad"];  // required Master's/PhD (llm_filter.decide)
   if (!ALLOWED_ROLES.has(f.role_type)) return ["reject", f.role_type === "non_software_engineering" ? "non_software_engineering" : "non_developer"];
   const ey = /^\s*0(?:\.\d+)?\s*(?:-|\u2013|to)\s*\d/.test(level) ? null : explicitYears(job.description);
   if (ey !== null && !FRESH_TEXT.test(String(job.description || "")) && !FRESH_TITLE.test(String(job.title || "")) &&
@@ -230,8 +231,8 @@ const NATIONWIDE = new RegExp(CONFIG.nationwide_regex || "$^", "i");
 const FOREIGN = CONFIG.foreign_regex ? new RegExp(CONFIG.foreign_regex, "i") : null;
 function inWantedLocation(job) {  // apify_jobs.in_wanted_location: unknown / "India"-only locations stay
   const words = CONFIG.city_words || [];
-  if (!words.length && !CONFIG.remote_ok) return true;
   const loc = String(job.location || "").toLowerCase();
+  if (!words.length && !CONFIG.remote_ok) return !(FOREIGN && FOREIGN.test(loc) && !loc.includes("india"));  // anywhere in India
   if (!loc.trim() || ["india", "in"].includes(loc.trim().replace(/^[ ,]+|[ ,]+$/g, ""))) return true;
   // "United States, Remote" / "Berlin, Remote" is not remote for you (apify_jobs._FOREIGN, back-tested)
   if (FOREIGN && FOREIGN.test(loc) && !loc.includes("india") && !words.some((w) => loc.includes(w))) return false;
@@ -966,7 +967,7 @@ async function aiStep(env, b) {
   const verdicts = rows.map((j, i) => {
     const r = byN[i + 1];
     if (!r || !ROLE[r.role] || !EMP[r.emp]) return null;
-    const f = { employment_type: EMP[r.emp], min_years_required: r.yrs, freshers_welcome: !!r.fresh, seniority: SEN[r.sen] || "unclear",
+    const f = { employment_type: EMP[r.emp], min_years_required: r.yrs, freshers_welcome: !!r.fresh, needs_postgrad: !!r.pg, seniority: SEN[r.sen] || "unclear",
                 role_type: ROLE[r.role], experience_evidence: r.ev || "", reason: r.why || "" };
     const [decision, category] = decide(f, j);
     return { f, decision, category };

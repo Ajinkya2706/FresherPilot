@@ -71,6 +71,7 @@ yrs: minimum years of experience REQUIRED (number) or null if never stated.
  Degree-dependent: the candidate has ONLY a bachelor's (B.E.), so use the bachelor's requirement, never the MS/PhD one ("BS and 5-8 years / MS and 3-6 / PhD and 0-3" -> 5).
  Ignore company age, "preferred/nice to have", "up to N years". Naukri field often starts at 0 by default; a higher JD minimum wins.
 fresh: true if the post says freshers / new grads / 0 years / no experience needed / entry-level can apply, in ANY wording, OR says skills, projects, portfolio or internships can replace the listed experience (even when it lists e.g. 3-5 years). false if it says freshers need not apply or never mentions it.
+pg: true ONLY if the post REQUIRES a master's degree or PhD/doctorate (M.Tech/MS/MSc/MBA/M.E./PhD "required", "must have"; "Master's or PhD" with no bachelor's option). false if only preferred / "or equivalent" / a bachelor's is enough / degree not mentioned.
 sen (title/level words ONLY, never from years): entry|mid|senior|lead|unclear
  mid = II/III/SDE-2/L3/"experienced". senior = senior/sr/staff/principal/architect. lead = lead/manager/head/director/VP/AVP/CTO.
  Associate/Junior/Graduate/Trainee/Engineer I/SDE-1 = entry. No level words = unclear.
@@ -105,12 +106,13 @@ SCHEMA = {
                     "emp": {"type": "string", "enum": list(_EMP)},
                     "yrs": {"type": ["number", "null"]},
                     "fresh": {"type": "boolean"},
+                    "pg": {"type": "boolean"},
                     "sen": {"type": "string", "enum": list(_SEN)},
                     "role": {"type": "string", "enum": list(_ROLE)},
                     "ev": {"type": "string"},
                     "why": {"type": "string"},
                 },
-                "required": ["n", "emp", "yrs", "fresh", "sen", "role", "ev", "why"],
+                "required": ["n", "emp", "yrs", "fresh", "pg", "sen", "role", "ev", "why"],
                 "additionalProperties": False,
             },
         }
@@ -124,7 +126,7 @@ def _expand_facts(r: dict[str, Any]) -> dict[str, Any]:
     """Short answer keys -> the full fact names the rest of the app uses."""
     return {
         "employment_type": _EMP.get(r.get("emp"), "unclear"), "min_years_required": r.get("yrs"),
-        "freshers_welcome": bool(r.get("fresh")), "seniority": _SEN.get(r.get("sen"), "unclear"),
+        "freshers_welcome": bool(r.get("fresh")), "needs_postgrad": bool(r.get("pg")), "seniority": _SEN.get(r.get("sen"), "unclear"),
         "role_type": _ROLE.get(r.get("role"), "other_non_developer"), "experience_evidence": r.get("ev") or "",
         "reason": r.get("why") or "",
     }
@@ -273,6 +275,8 @@ def decide(facts: dict[str, Any], job: dict[str, Any]) -> tuple[str, str]:
                                  or re.search(_FRESH_TITLE, str(job.get("title") or ""), re.I))  # "fresh" with no support in the post is a guess
     if re.search(r"mid-senior", level, re.I) and not (fresh_ok or low_years):
         return "reject", "too_senior"
+    if facts.get("needs_postgrad"):  # owner (Nov 15): has a bachelor's only, so a required Master's/PhD means not eligible
+        return "reject", "needs_postgrad"
     if facts.get("role_type") not in ALLOWED_ROLES:
         return "reject", "non_software_engineering" if facts.get("role_type") == "non_software_engineering" else "non_developer"
     ey = None if re.match(r"\s*0(?:\.\d+)?\s*(?:-|\u2013|to)\s*\d", level) else explicit_years(job.get("description"))
