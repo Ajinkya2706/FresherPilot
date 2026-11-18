@@ -1,0 +1,14 @@
+{
+  "captured": "2026-11-18, owner's Chrome, no submit, no personal values",
+  "layout": "new SDUI jobs/search-results (buttons, obfuscated classes: never select by class)",
+  "apply_button": {"tag": "BUTTON", "aria_label": "Easy Apply to this job", "text": "Easy Apply", "attrs": ["class", "type", "componentkey", "aria-label"], "in_shadow": false},
+  "dialog": {"element": "dialog[open] in the main document (not shadow, not iframe)", "labelledby": "dialog-header", "progress_text": "1/4 pages", "buttons_step1": ["Dismiss (aria-label)", "Next"], "ids": "React-generated _r_N_ (not stable)"},
+  "step1_fields": [
+    {"label": "Email address*", "type": "select-one", "options": 4},
+    {"label": "Phone country code*", "type": "select-one", "options": 250},
+    {"label": "Mobile phone number*", "type": "tel"}
+  ],
+  "close_flow": "Dismiss -> second stacked dialog 'Save this application?' with Dismiss / Discard / Save",
+  "closed_job_page": "text 'Not currently accepting applications' and no apply button (job posted 12 h earlier)",
+  "interop_outlet": "div#interop-outlet has an (empty) shadow root: not where the form lives"
+}

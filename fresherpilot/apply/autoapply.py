@@ -198,13 +198,14 @@ def emailed_only() -> set[str]:
     return mailed - site
 
 
-def eligible_jobs(include_with_instructions: bool = False, force: set[str] | None = None) -> list[dict[str, Any]]:
+def eligible_jobs(include_with_instructions: bool = False, force: set[str] | None = None,
+                  only: set[str] | None = None) -> list[dict[str, Any]]:
     """AI-approved jobs not applied yet, newest first. force = uids the user asked for by link: no AI verdict needed."""
     from fresherpilot.apply import applicant
     from fresherpilot.outreach import contacts
     from fresherpilot.jobs import llm_filter
     from fresherpilot.jobs.apify_jobs import load_cache
-    from fresherpilot.server import _newest_first, _normalized_jobs
+    from fresherpilot.server import _jobs_by_uids, _newest_first, _normalized_jobs
 
     apps = applicant.applications()
     email_only = emailed_only()
@@ -212,7 +213,8 @@ def eligible_jobs(include_with_instructions: bool = False, force: set[str] | Non
     never_keys = {k for e in prefs["never"].values() for k in (e.get("keys") or [])} | set(prefs["never"])
     blocked = {c.lower() for c in prefs["blocked"]}
     out = []
-    for job in _normalized_jobs(load_cache()):
+    # only = the uids asked for (one job by link): clean just those, not all ~27k jobs (that was 15 s of the start)
+    for job in (_jobs_by_uids(only) if only else _normalized_jobs(load_cache())):
         if not (job.get("url") or "").startswith("http"):
             continue
         uid = f"{job.get('source')}:{job.get('id')}"
@@ -386,6 +388,69 @@ def _tag_linkedin(todo: list[dict[str, Any]]) -> None:
         TAG.update(running=False, finished=time.time())
 
 
+_CLOSED_CHECKED: dict[str, float] = {}  # uid -> when its LinkedIn page was last read (re-read after 3 h)
+
+
+def preflight_closed(jobs: list[dict[str, Any]], budget_s: float = 20.0) -> list[dict[str, Any]]:
+    """Closed LinkedIn jobs were 44% of all skips (137 of 313 in the log): each one cost a tab and ~20 s. LinkedIn's
+    guest page (free, no login) says "No longer accepting applications" / 404 for them: read it first, drop them
+    (and remember them as never-again). Time-boxed (the guest API is throttled to 1 request / 2.5 s); a blocked or
+    failed read keeps the job (the extension still checks the real page)."""
+    import requests
+
+    from fresherpilot.jobs import free_boards
+
+    deadline, now = time.time() + budget_s, time.time()
+    session = requests.Session()
+    closed: set[str] = set()
+    for j in jobs:
+        if j.get("source") != "LinkedIn" or not str(j.get("id") or "").isdigit():
+            continue
+        if now - _CLOSED_CHECKED.get(j["uid"], 0) < 3 * 3600:
+            continue
+        if time.time() > deadline:
+            break
+        try:
+            r = free_boards._li_get(session, free_boards._LI_JOB.format(j["id"]))
+        except free_boards.Blocked:
+            break
+        except Exception:  # noqa: BLE001 — one page's problem: keep the job
+            continue
+        _CLOSED_CHECKED[j["uid"]] = time.time()
+        if r is None or _CLOSED_LI.search(r.text):
+            remember_never(j["uid"], "LinkedIn: " + ("job removed" if r is None else "no longer accepting applications"),
+                           {"title": j.get("title"), "company": _company(j), "source": "LinkedIn", "jd_keys": _jd_keys(j)})
+            closed.add(j["uid"])
+    return [j for j in jobs if j["uid"] not in closed]
+
+
+def handoff_to_site(job: dict[str, Any], landed_url: str) -> str:
+    """An extension attempt that left the board for a company page (LinkedIn / Naukri "apply on company site"): the
+    local Playwright runner (`site_apply`, a real Chrome window on this laptop) takes the job from there. Returns the
+    ATS name ("company site" when unknown); "" = not handed over (still on the board, not a portal page, or queued
+    already), the extension run goes on as before."""
+    from fresherpilot.apply import route, site_apply
+
+    uid = str(job.get("uid") or "")
+    new = route.reclassify_after_landing(job, landed_url)
+    if not uid or not new or _FORM.search(landed_url or ""):   # Google / MS forms are filled by the extension (applyWithForms)
+        return ""
+    if site_apply.enqueue(job, landed_url, why="landed off the board") != "queued":
+        return ""
+    return new["ats"] or "company site"
+
+
+def _site_target(job: dict[str, Any]) -> str:
+    """The company-site link of a job whose own link already is one (Careers pages, Telegram posts with a resolved
+    link, Indeed copies of a company-site job), "" otherwise: those go straight to the local Playwright runner."""
+    from fresherpilot.apply import route
+
+    c = route.classify(job)
+    if c["cls"] != "site" or c["signal"] not in ("url_host", "blog_url_host"):
+        return ""
+    return str(job.get("blog_url") if c["signal"] == "blog_url_host" else job.get("url") or "")
+
+
 def preview() -> dict[str, Any]:
     """Jobs Auto-apply would do, per platform (for the platform checkboxes on the Auto-apply page)."""
     from fresherpilot.outreach.telegram_bot import apply_mode
@@ -412,7 +477,7 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
             raise RuntimeError("Auto-apply is already running")
     single = bool(uids)
     done_email = emailed_only()
-    jobs = eligible_jobs(include_with_instructions=True, force=set(force or ()))
+    jobs = eligible_jobs(include_with_instructions=True, force=set(force or ()), only=set(uids) if uids else None)
     if pick and not uids:  # the jobs ticked on the Auto-apply page (bulk run, Easy Apply first as usual)
         chosen = set(pick)
         jobs = [j for j in jobs if j["uid"] in chosen]
@@ -442,8 +507,35 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
             raise RuntimeError("That job isn't eligible (already applied, or not approved).")
     if max_jobs > 0:  # 0 = no limit: every approved job, Easy Apply ones first
         jobs = jobs[:max_jobs]
+    if not single:  # a job the user picked by hand is always tried; a bulk run drops closed LinkedIn jobs first
+        jobs = preflight_closed(jobs)
+        # per-site breaker: 3 of a site's last 5 attempts broke on OUR side (page errors, stuck, no button...) in the
+        # last 12 h = its page probably changed: leave that site out of this bulk run instead of burning every job on it
+        try:
+            from fresherpilot.apply import failures
+
+            tripped = failures.tripped_sources([json.loads(x) for x in _log_path().read_text(encoding="utf-8").splitlines()[-400:] if x.strip()])
+        except (OSError, ValueError):
+            tripped = {}
+        if tripped:
+            kept = [j for j in jobs if str(j.get("source")) not in tripped]
+            if len(kept) < len(jobs):
+                _log("start", None, f"site paused (3 of its last 5 attempts broke): {', '.join(sorted(tripped))}; pick a job of it by hand to try again")
+            jobs = kept
+        if not jobs:
+            raise RuntimeError("Every approved job in this run is closed, already handled, or on a site paused after repeated breakage (see the log).")
     queue, browser, emails, manual = [], [], [], []
+    site_jobs = 0
     for j in jobs:
+        # Pipeline B: a job whose own link is a company / ATS page goes straight to the local Playwright runner (not
+        # when you picked this one job by hand, or when its post has special instructions: email / forms)
+        target = "" if single else _site_target(j)
+        if target and not (j.get("apply_instructions") and (_instruction_plan(j)["emails"] or _instruction_plan(j)["forms"] or _instruction_plan(j)["manual"])):
+            from fresherpilot.apply import site_apply
+
+            if site_apply.enqueue(j, target, why="company-site link") == "queued":
+                site_jobs += 1
+            continue
         item = {"uid": j["uid"], "url": j["url"], "title": j["title"], "company": j.get("employer") or j.get("company"),
                 "source": j.get("source"), "jd_keys": _jd_keys(j)}
         plan = _instruction_plan(j)
@@ -466,7 +558,8 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
                      final=[], paused=False, current_at=None, run_id=uuid.uuid4().hex[:12], ext_seen=time.time())
         STATE["titles"].update({q["uid"]: {"title": q.get("title"), "company": q.get("company")} for q in queue})
     _log("start", None, f"{len(queue)} job(s) queued ({'this job' if single else 'Easy Apply first, then newest'}): "
-                        f"{len(browser)} in the browser, {len(emails)} by email, {len(manual)} need you")
+                        f"{len(browser)} in the browser, {len(emails)} by email, {len(manual)} need you"
+                        + (f", {site_jobs} company-site job(s) to the local Playwright runner" if site_jobs else ""))
     for item, summary in manual:
         report("skipped", item["uid"], f"needs you: {summary[:140]}")
     if emails:
@@ -548,9 +641,9 @@ def report(event: str, uid: str | None, detail: str = "", waiting: dict[str, Any
         applicant.set_application(uid, "applied", note="auto-applied" if event == "applied" else "emailed")
         from fresherpilot.jobs import visited
         from fresherpilot.jobs.apify_jobs import load_cache
-        from fresherpilot.server import _normalized_jobs
+        from fresherpilot.server import _jobs_by_uids
 
-        match = [j for j in _normalized_jobs(load_cache()) if f"{j.get('source')}:{j.get('id')}" == uid]
+        match = _jobs_by_uids({uid})
         if match:
             visited.mark(match, True)
     if event != "job_start" or detail:
@@ -641,7 +734,8 @@ def status() -> dict[str, Any]:
         return ({k: v for k, v in STATE.items() if k not in ("log", "queue", "parked", "job_commands", "final", "titles", "ext_seen", "pending", "started_at")}
                 | {"log": STATE["log"][-200:], "parked": list(STATE["parked"].values()), "next": nxt,
                    "waiting_for_browser": STATE.get("pending") is not None and STATE["running"],
-                   "ext_seen_s": round(time.time() - seen) if seen else None})
+                   "ext_seen_s": round(time.time() - seen) if seen else None,
+                   "site": __import__("fresherpilot.apply.site_apply", fromlist=["status"]).status()})
 
 
 def reset() -> dict[str, Any]:
@@ -782,6 +876,12 @@ def _playbook(snap: dict[str, Any], items: list[dict[str, Any]], filled: bool, s
                         "is_submit": bool(re.search(r"submit", label, re.I))}
     if dialog:
         inside = [it for it in items if it.get("in_dialog") and it.get("tag") != "a"]
+        # LinkedIn stacks a second <dialog> "Save this application?" (Dismiss / Discard / Save) when the form is closed
+        # (live capture Nov 18): we never keep drafts, so Discard it and let the run move on.
+        if source == "LinkedIn" and re.search(r"save this application\?", snap.get("text", ""), re.I):
+            disc = [it for it in inside if re.match(r"^discard$", _label(it), re.I)]
+            if len(disc) == 1:
+                return {"action": "click", "key": disc[0]["key"], "reason": "playbook: LinkedIn Discard draft", "is_submit": False}
         # Naukri's recruiter questions (side drawer): radio options are labels, then a Save button. Answer the
         # affirmative option ("Yes", "Yes - Interested"...), press Save, repeat for the next question. Anything that is
         # not a plain choice (free text, "No" only...) stays with the AI / you.
@@ -845,6 +945,13 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
     filled, submitted = bool(body.get("filled")), bool(body.get("submitted"))
     history = body.get("history") or []
 
+    # A removed Naukri job redirects to a search-results page (or the dashboard). Skip it at once: the AI otherwise wanders Naukri looking for the
+    # job (Nov 18: ~1 minute and 3 AI calls per removed job, and it navigated to the user's dashboard).
+    _job = body.get("job") or {}
+    if "naukri.com/job-listings-" in str(_job.get("url") or "") and not submitted and \
+            re.search(r"naukri\.com/(?:[a-z0-9-]+-jobs(?:-in-[a-z0-9-]+)?(?:-\d+)?(?:\?|$)|mnjuser/homepage|jobs-in-)", url):
+        return {"action": "skip", "key": "", "reason": "The posting is closed or removed (Naukri redirected to its search results)"}
+
     # LinkedIn caps Easy Apply submissions per day ("You reached today's Easy Apply limit"): nothing more goes through
     # until tomorrow. Remember it for 14 h and skip every further LinkedIn job at once (not "never again": retry later).
     job_src = (body.get("job") or {}).get("source", "")
@@ -853,6 +960,13 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
             STATE["li_limit_at"] = time.time()
         if time.time() - float(STATE.get("li_limit_at") or 0) < 14 * 3600:
             return {"action": "skip", "key": "", "reason": "LinkedIn Easy Apply daily limit reached: will retry tomorrow"}
+
+    # Landed on a company / ATS page from a board: the local Playwright runner does these (own Chrome window, per-portal
+    # account, codes from Gmail or Telegram); nothing to do here.
+    if not submitted and not filled and job_src and (body.get("job") or {}).get("uid"):
+        ats = handoff_to_site(body["job"], url)
+        if ats:
+            return {"action": "skip", "key": "", "reason": f"handed to the local Playwright runner ({ats}): it fills the form in its own Chrome window"}
 
     # Code-level checks first (cheap and reliable).
     if submitted and CONFIRMED.search(full):
@@ -870,8 +984,28 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
     # instead of looping until the time limit.
     last = [str(h) for h in history[-6:]]
     ai_loop = len(last) >= 4 and len(set(last[-4:])) == 1 and "playbook" not in last[-1]
+    # The same click alternating with the "fill form fields" playbook (Nov 18, Naukri education dialog: option click, fill, option click, fill... every
+    # 12 s for minutes): ignore the playbook entries when counting. First try the dialog's own forward button (Save), then give up.
+    real = [str(h) for h in history[-14:] if "playbook" not in str(h)]
+    if len(real) >= 3 and len(set(real[-3:])) == 1 and snap.get("dialog"):
+        fwd = [it for it in (snap.get("items") or []) if it.get("in_dialog") and it.get("tag") != "a"
+               and (FORWARD.match((it.get("text") or it.get("label") or "").strip())
+                    or re.match(r"^(save|done|update|apply)$", (it.get("text") or it.get("label") or "").strip(), re.I))]
+        if fwd:
+            label = (fwd[0].get("text") or fwd[0].get("label") or "").strip()
+            if not any(label.lower() in str(h).lower() for h in history[-14:]):
+                return {"action": "click", "key": fwd[0]["key"], "reason": f"the same click repeated: moving on with '{label[:30]}'",
+                        "is_submit": bool(re.search(r"submit|send application|finish", label, re.I))}
+    if len(real) >= 5 and len(set(real[-5:])) == 1:
+        return {"action": "skip", "key": "", "reason": "no progress: the same click repeated and nothing changed (form not fillable automatically)"}
     if ai_loop or (len(last) >= 6 and len(set(last)) == 1):
         return {"action": "skip", "key": "", "reason": "no progress: the same step repeated and nothing changed (button disabled or not applicable)"}
+
+    # Internshala: the Submit of the apply form is pressed ONCE. What follows (Nov 18) is a window of recommended /
+    # similar jobs with its own Submit that would apply to OTHER jobs: the application is already in, so the job is
+    # done and that window is never submitted (the Applications list showed only the one job, but it must not happen).
+    if submitted and job_src == "Internshala":
+        return {"action": "done", "key": "", "reason": "Internshala: application submitted once; the follow-up window lists other jobs and is left alone"}
 
     # After our own Submit click, a board that now shows "Already applied" / "Applied" confirms it (Internshala has no
     # confirmation text: Nov 12 the application went through but was logged as skipped).

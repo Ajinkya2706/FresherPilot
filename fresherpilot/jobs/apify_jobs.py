@@ -1029,7 +1029,10 @@ def naukri_sweep_plan() -> dict[str, Any]:
     for role in prefs["roles"]:
         slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
         for exp in cfg.naukri_passes(prefs):
-            q = f"k={quote_plus(role)}&experience={exp}&jobAge={age}" + (f"&l={quote_plus(loc)}" if loc else "")
+            # NO location in the URL (measured Nov 18 in the owner's Chrome): a multi-city `l=` makes Naukri redirect
+            # to a city slug and DROP jobAge/experience (9,883 results, "3+ weeks ago"). Without it jobAge=1 works
+            # (62 results, all <= 1 day). The app's own city filter drops other cities after the read.
+            q = f"k={quote_plus(role)}&experience={exp}&jobAge={age}"
             urls.append(f"https://www.naukri.com/{slug}-jobs?{q}")
     return {"urls": urls, "max_pages": 5, "gap_seconds": [4, 8], "job_age_days": age}
 
@@ -1038,6 +1041,26 @@ def _users_mod():
     from fresherpilot.core import users
 
     return users
+
+
+_SHARED: dict[str, Any] = {}
+
+
+def load_cache_shared() -> dict[str, Any] | None:
+    """The saved jobs, parsed once per file change and SHARED: read-only callers (lookups, counts) must not modify it.
+    A full load_cache() parses ~100 MB every call (~0.6 s); this is free until the file changes."""
+    path = _cache_path()
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    sig = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _SHARED.get("hit")
+    if hit and hit[0] == sig:
+        return hit[1]
+    payload = load_cache()
+    _SHARED["hit"] = (sig, payload)
+    return payload
 
 
 def load_cache() -> dict[str, Any] | None:

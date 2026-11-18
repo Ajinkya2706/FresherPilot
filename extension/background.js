@@ -354,6 +354,7 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
   try {
     let filled = false;
     let submitted = false;
+    let disappearedAfterSubmit = 0;
     let refills = 0;
     let rescanned = false;
     let reloads = 0;
@@ -471,7 +472,15 @@ async function applyJob(job, settings, mode, resumeTabId = null, token = null) {
       await sleep(rand(decision.is_submit ? settings.before_submit : settings.step_delay));
       const before = new Set((await chrome.tabs.query({})).map((t) => t.id));
       const ok = await inTab(tabId, (k) => window.__jfAgent.click(k), [decision.key]);
-      if (!ok) return { event: "skipped", detail: "the chosen button disappeared" };
+      if (!ok) {
+        // After our own Submit the form is gone and so are its buttons (Internshala, Nov 18: applied, but logged as
+        // skipped): look at the page again; the app confirms "Applied" / the confirmation text and ends the job as done.
+        if (submitted && ++disappearedAfterSubmit <= 3) {
+          await sleep(900);
+          continue;
+        }
+        return { event: "skipped", detail: "the chosen button disappeared" };
+      }
       if (decision.is_submit) submitted = true;
       await sleep(600);
       // Followed a link that opened a new tab (e.g. "Apply on company site")? Continue there.
@@ -576,10 +585,16 @@ async function finish(parked, job, result) {
 // The extension PULLS a run the app has started (consumer model): the page no longer has to be open. The app keeps
 // the started run as "pending"; this asks for it every ~30 s (an alarm wakes the worker) and starts it once.
 const PENDING_ALARM = "jf-autoapply-pending";
+let pulling = false;
 async function pullPendingRun() {
-  if (running) return;
-  const r = await api("/api/autoapply/pending").catch(() => null);
-  if (r && r.start && !running) await runQueue(r.start);
+  if (running || pulling) return;
+  pulling = true;
+  try {
+    // long poll: the app holds this request up to 25 s and answers the moment a run is started, so a run begins at once
+    // (the alarm below only has to re-open the poll); an older app ignores ?wait and answers straight away
+    const r = await api("/api/autoapply/pending?wait=25").catch(() => null);
+    if (r && r.start && !running) await runQueue(r.start);
+  } finally { pulling = false; }
 }
 function ensurePendingAlarm() { chrome.alarms.create(PENDING_ALARM, { periodInMinutes: 0.5 }); }
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === PENDING_ALARM) pullPendingRun().catch(() => {}); });

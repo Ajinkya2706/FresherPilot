@@ -194,6 +194,7 @@ _YEARS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:(?:-|–|to)\s*(\d+(?:\.\d+)
 _YEARS_SOFT = re.compile(r"less than|up to|upto|under|below|maximum|max\.?|within|preferred|desirable|good to have|nice to have|"
                          r"a plus|bonus|warrant|guarantee|duration|contract of|bond|service agreement|since|founded|established|"
                          r"over the (?:last|past)|for the (?:last|past)|over|more than|collective|anniversar|history|legacy|decades?|we have|we've|\bage\b", re.I)
+PRE_AI_YEARS_MIN = 3  # free reject before the AI when the post states this many years (see _board_reject)
 EXPLICIT_YEARS_MIN = 2  # 1 year is left to the AI (the owner's reject_from_years rule); 2+ stated in the text is clear
 
 
@@ -357,6 +358,9 @@ def forget(jobs: list[dict[str, Any]]) -> None:
 
 
 def job_key(job: dict[str, Any]) -> str:
+    vk = job.get("_vk")  # set when an old rejected job's description was shortened: the key of the FULL text (same prompt version)
+    if isinstance(vk, list) and len(vk) == 2 and vk[0] == PROMPT_VERSION:
+        return vk[1]
     parts = [PROMPT_VERSION] + [str(job.get(k) or "") for k in ("title", "company", "experience", "work_type", "description")]
     return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
 
@@ -924,6 +928,14 @@ def _board_reject(job: dict[str, Any]) -> tuple[str, str] | None:
         if ai_reads_years_posts(job):  # the AI reads the post: "3-5 yrs" may still welcome freshers with skills
             return None
         return "needs_experience", f"{job.get('source')} lists {level}"
+    # Nov 16: the post itself states PRE_AI_YEARS_MIN+ years and nothing welcomes freshers: decide() rejects it after the AI call anyway
+    # (back-test, 4,625 AI-checked jobs of 5 days: 1,586 = 34% skip the AI, the 2 approved ones among them are rejected by today's decide()).
+    # Same rule in cloud/src/index.js boardReject.
+    if not re.match(r"\s*0(?:\.\d+)?\s*(?:-|–|to)\s*\d", level):
+        ey = explicit_years(job.get("description"))
+        if (ey is not None and ey >= PRE_AI_YEARS_MIN and not has_fresher_text(job.get("description"))
+                and not re.search(_FRESH_TITLE, str(job.get("title") or ""), re.I)):
+            return "needs_experience", f"The post asks for {ey:g}+ years"
     return None
 
 

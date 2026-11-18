@@ -175,7 +175,7 @@ def seed_sql() -> str:
     return "\n".join(lines) + "\n"
 
 
-BOT_COMMANDS = [("jobs", "Newest jobs you haven't marked"), ("easy", "Easy Apply jobs (for the phone)"),
+BOT_COMMANDS = [("dashboard", "Today: jobs applied, priority applied, alerts"), ("jobs", "Newest jobs you haven't marked"),("easy", "Easy Apply jobs (for the phone)"),
                 ("site", "Company-site jobs (for the laptop)"), ("status", "Pipeline status: sources, stages, alerts"),
                 ("laptopoff", "Hand everything to the cloud now"), ("stop", "Pause alerts"),
                 ("resume", "Turn alerts back on"), ("help", "All commands")]

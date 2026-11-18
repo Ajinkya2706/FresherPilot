@@ -35,3 +35,9 @@ CREATE INDEX IF NOT EXISTS claims_at ON claims(at);
 CREATE INDEX IF NOT EXISTS alerts_at ON alerts(at);
 CREATE INDEX IF NOT EXISTS actions_at ON actions(at);
 CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS ai_usage (        -- AI tokens per day (IST) / provider / model / key number / step
+  day TEXT, provider TEXT, model TEXT, key_no INTEGER, step TEXT,
+  calls INTEGER DEFAULT 0, fails INTEGER DEFAULT 0, tok_in INTEGER DEFAULT 0, tok_out INTEGER DEFAULT 0, tok_total INTEGER DEFAULT 0, tok_cached INTEGER DEFAULT 0,
+  PRIMARY KEY (day, provider, model, key_no, step)
+);
+CREATE INDEX IF NOT EXISTS jobs_tcf ON jobs(title COLLATE NOCASE, company COLLATE NOCASE, found_at);  -- verdict reuse for the same post

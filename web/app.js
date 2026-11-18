@@ -773,8 +773,14 @@ let loadInFlight = null;
 async function showUsage() {
   try {
     const u = await (await fetch("/api/usage")).json();
-    const parts = Object.entries(u.models || {}).map(([m, n]) => `${m.split("/").pop()} ${Math.round(n / 1000)}k/${u.daily_limit_per_model / 1000}k`);
-    $("usage").textContent = parts.length ? `AI tokens today: ${parts.join(" · ")}` : "";
+    // Groq's free limit is per key per model (200k); NVIDIA's free tier has no daily cap we can read, so it shows only the count.
+    const k = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
+    const nv = (m) => /nemotron|minimax|nvidia/i.test(m);
+    const groq = Object.entries(u.models || {}).filter(([m]) => !nv(m)).map(([m, n]) => `${m.split("/").pop()} ${k(n)}`);
+    const nvidia = Object.entries(u.models || {}).filter(([m]) => nv(m)).reduce((a, [, n]) => a + n, 0);
+    const parts = [...groq, ...(nvidia ? [`NVIDIA ${k(nvidia)}`] : [])];
+    $("usage").textContent = parts.length ? `AI tokens today (this laptop): ${parts.join(" · ")}` : "";
+    $("usage").title = `Groq free tier: ${u.daily_limit_per_model / 1000}k tokens per model per key per day, shared with the cloud. NVIDIA: no daily cap shown.`;
   } catch {}
 }
 setInterval(showUsage, 30000);

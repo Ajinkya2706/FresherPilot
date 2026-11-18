@@ -33,8 +33,12 @@ def source_of(url: str) -> tuple[str, str]:
         m = re.search(r"-(\d{9,})(?:[?#/]|$)", u) or re.search(r"jobId=(\d+)", u)
         return "Naukri", m.group(1) if m else ""
     if "indeed." in u:
-        m = re.search(r"jk=([0-9a-f]{10,})", u)
+        # viewjob?jk=<id>; the smartapply link carries it as jk= inside its pingback, else only the applyable id
+        m = re.search(r"(?:[?&]|%26)jk(?:=|%3D)([0-9a-f]{10,})", u) or re.search(r"indeedApplyableJobId=([\w-]{10,})", u)
         return "Indeed", m.group(1) if m else ""
+    if "wellfound.com" in u:
+        m = re.search(r"/jobs/(\d{5,})", u) or re.search(r"job_listing_slug=(\d{5,})", u)
+        return "Wellfound", m.group(1) if m else ""
     for host, name in (("internshala.com", "Internshala"), ("wellfound.com", "Wellfound"), ("greenhouse.io", "Careers"),
                        ("lever.co", "Careers"), ("ashbyhq.com", "Careers"), ("myworkdayjobs.com", "Careers"),
                        ("foundit.in", "Foundit"), ("instahyre.com", "Instahyre"), ("cutshort.io", "Cutshort"),
@@ -42,6 +46,34 @@ def source_of(url: str) -> tuple[str, str]:
         if host in u:
             return name, ""
     return "Other", ""
+
+
+_STUB_SOURCES = {"Naukri", "Wellfound", "Indeed", "Internshala"}
+
+
+def stub_from_url(url: str) -> dict[str, Any] | None:
+    """A minimal job made from the LINK alone, for boards whose pages the app cannot read (Naukri / Indeed block plain
+    HTTP, Wellfound is behind DataDome). Used only when the user named the job himself: the extension reads the real
+    page when it applies, so title / company here are just labels (words from the link's slug)."""
+    src, jid = source_of(url)
+    if src not in _STUB_SOURCES or not jid:
+        return None
+    u = url.strip()
+    slug, company = "", ""
+    if src == "Naukri":
+        m = re.search(r"job-listings-(.+?)-(\d{9,})", u)
+        slug = re.sub(r"-\d+-to-\d+-years?$|-\d+-years?$", "", m.group(1) if m else "").replace("-", " ")
+    elif src == "Wellfound":
+        m = re.search(r"/jobs/\d+-([\w-]+)", u) or re.search(r"job_listing_slug=\d+-([\w-]+)", u)
+        slug = (m.group(1) if m else "").replace("-", " ")
+        u = f"https://wellfound.com/jobs/{jid}" + (f"-{m.group(1)}" if m else "")
+    elif src == "Internshala":
+        m = re.search(r"/job/detail/([\w-]+?)-?\d{6,}", u)
+        slug = (m.group(1) if m else "").replace("-", " ")
+    title = slug.strip().title() or f"{src} job"
+    return {"title": title, "company": company or src, "location": "", "experience": "Not specified", "salary": "Not disclosed",
+            "skills": [], "description": f"{title} ({src} link added by you; the page is read when applying).", "work_type": "",
+            "url": u, "id": jid, "source": src, "stub": True}
 
 
 def _norm_url(url: str) -> str:
@@ -225,6 +257,10 @@ def report(url: str) -> dict[str, Any]:
             job = _read_page(url)
     except Exception as exc:  # noqa: BLE001
         error = str(exc)[:200]
+    if not (job and job.get("title")):
+        job = stub_from_url(url) or job
+        if job and job.get("stub"):
+            error = ""
     added = 0
     if job and job.get("title"):
         job.update(source=job.get("source") or src if src != "Other" else "Added by you", url=job.get("url") or url,

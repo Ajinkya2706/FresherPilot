@@ -113,3 +113,15 @@ Zensar 9, Capgemini ~7, Birlasoft 4, Genpact 3, Cognizant 2, Mphasis 2, CGI 2.
   every ~100 s instead of ~3 h (old `srcCareers` still runs for its 44 pages, slowly).
 - **Title rule** `TITLE_LEVEL`: "L3".."L9" in the title = experienced (Wipro/Cognizant grades; L1 = fresher, L2 left to the AI). Back-test: 72
   cached jobs, 0 approved, 0 applied.
+
+## Nov 17 2026: 92 target companies (3-AI cross-check), Indeed company machines
+- Asked ChatGPT, Gemini and Grok the same prompt (no personal data): India companies that hire 0-year freshers through apply -> simple online
+  assessment (aptitude/English/basic coding) -> interviews -> offer; hard-DSA firms and TCS-NQT-only gates excluded. ChatGPT and Gemini gave ~85 /
+  ~100 rows each (Grok partial, same names). Kept the ones realistic for a tier-3 fresher; dropped Razorpay, PhonePe, Meesho, Swiggy, CRED, Postman,
+  BrowserStack, InMobi, Groww, DevRev, Sarvam, JPMorgan (hard DSA) and companies whose LinkedIn page id was not certain (Barclays, Quest Global, NielsenIQ).
+- `TARGET_COMPANIES_LI` is now 92 names (was 25): `deploy.py --config` -> cloud `li_companies` -> the same list drives LinkedIn (co0/co1, f_C search, all
+  roles), Indeed (company text search, whole-word company match) and nothing on Naukri (Apify credit: $4.57 of $5 used Nov 17, resets Nov 24;
+  `NAUKRI_COMPANY_TERMS` unchanged at 25).
+- Indeed company searches now run on their own machines `ic0` / `ic1` (half the names each, `indeed.yml` matrix `[indeed, ic0, ic1]`); the `indeed`
+  machine does role x place only. Read keys `indeed_ic0` / `indeed_ic1` in `gh_read`. The matrix change applies when the current indeed run ends.
+- Foundit: search JSON (`/middleware/jobsearch`, no login) works but has no description and job pages are Access Denied; not built (decision pending).

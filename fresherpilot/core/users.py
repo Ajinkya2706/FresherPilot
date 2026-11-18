@@ -81,6 +81,18 @@ def _registry() -> dict[str, Any]:
     return copy.deepcopy(_reg_mem["data"])
 
 
+def _registry_ro() -> dict[str, Any]:
+    """Same data WITHOUT the copy, for callers that only read (owner_id/current run ~50k times per list build: the copy
+    was 2 s of it). Never modify the result."""
+    try:
+        mtime = REGISTRY.stat().st_mtime_ns
+    except OSError:
+        return {}
+    if mtime != _reg_mem["mtime"]:
+        return _registry()
+    return _reg_mem["data"]
+
+
 def _save_registry(data: dict[str, Any]) -> None:
     USERS_DIR.mkdir(exist_ok=True)
     REGISTRY.write_text(json.dumps(data, indent=1), encoding="utf-8")
@@ -88,11 +100,11 @@ def _save_registry(data: dict[str, Any]) -> None:
 
 
 def owner_id() -> str | None:
-    return next((uid for uid, u in _registry().items() if u.get("owner")), None)
+    return next((uid for uid, u in _registry_ro().items() if u.get("owner")), None)
 
 
 def get(uid: str) -> dict[str, Any] | None:
-    u = _registry().get(uid)
+    u = _registry_ro().get(uid)
     if not u:
         return None
     return {"id": uid, "username": u["username"], "owner": bool(u.get("owner")), "created": u.get("created"),
@@ -101,11 +113,11 @@ def get(uid: str) -> dict[str, Any] | None:
 
 
 def list_users() -> list[dict[str, Any]]:
-    return [get(uid) for uid in _registry()]
+    return [get(uid) for uid in _registry_ro()]
 
 
 def list_usernames() -> list[str]:
-    return [u["username"] for u in _registry().values()]
+    return [u["username"] for u in _registry_ro().values()]
 
 
 def _hash(password: str, salt: bytes) -> str:
@@ -165,7 +177,7 @@ def _persist(token: str | None = None, drop: list[str] | None = None) -> None:
 def _restore(token: str) -> dict[str, Any] | None:
     """A session saved before the app restarted: unlock it with the token and load the user's keys."""
     rec = _read_sessions().get(_token_id(token))
-    if not rec or rec.get("expires", 0) < time.time() or rec.get("uid") not in _registry():
+    if not rec or rec.get("expires", 0) < time.time() or rec.get("uid") not in _registry_ro():
         return None
     try:
         f = _token_fernet(token)
@@ -198,7 +210,7 @@ def current() -> str | None:
         return uid
     env_user = os.getenv("JF_USER")
     if env_user:
-        return next((i for i, u in _registry().items() if u["username"] == env_user), None)
+        return next((i for i, u in _registry_ro().items() if u["username"] == env_user), None)
     return owner_id()  # command-line tools (recheck.py, check_filter.py) work for the owner
 
 
@@ -482,7 +494,7 @@ def local_token() -> str | None:
     if _local_token and session_user(_local_token[0]):
         return _local_token[0]
     uid = owner_id()
-    u = _registry().get(uid or "") or {}
+    u = _registry_ro().get(uid or "") or {}
     wrapped = u.get("lwrap") or u.get("gwrap")
     if not wrapped:
         return None

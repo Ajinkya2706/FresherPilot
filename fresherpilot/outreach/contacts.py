@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+import time
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -465,5 +466,6 @@ def prefetch(jobs: list[dict[str, Any]], progress: Callable[[int, int], None] | 
             get_contacts(job)  # if web search is blocked it fails fast; guesses are still saved
         except Exception:  # noqa: BLE001 — one company failing must not stop the rest
             pass
+        time.sleep(0.6)  # background work: after a day offline this ran flat out and starved the app's own requests (Nov 18)
     if progress:
         progress(total, total)

@@ -5,6 +5,7 @@
    4. uiToast(message, kind) */
 (function () {
   "use strict";
+  document.documentElement.setAttribute("data-theme", "light");   // light only (owner, Nov 18): never follow the OS dark mode
 
   // ---- progress bar + offline detection: wrap fetch --------------------------------------------------------
   const bar = document.createElement("div");
@@ -85,4 +86,53 @@
     setInterval(() => { if (!document.hidden) realFetch("/api/health").then(() => setOffline(false), () => setOffline(true)); }, 10000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ready); else ready();
+})();
+
+/* ---- design v2 motion (loaded on every page): sliding tab pill + fade-out before navigating --------------------------- */
+(function () {
+  "use strict";
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function place(c) {
+    const on = c.querySelector(".tab.on, a[aria-current='page']");
+    if (!on || !on.offsetWidth) { c.style.setProperty("--on", "0"); return; }
+    const first = !c.dataset.ready;
+    if (first) c.classList.add("d2-noanim");
+    c.style.setProperty("--x", on.offsetLeft + "px");
+    c.style.setProperty("--w", on.offsetWidth + "px");
+    c.style.setProperty("--on", "1");
+    if (first) {
+      c.dataset.ready = "1";
+      requestAnimationFrame(() => requestAnimationFrame(() => c.classList.remove("d2-noanim")));
+    }
+  }
+  const pills = new Set();
+  function watch() {
+    document.querySelectorAll(".tabs, .ui-links").forEach((c) => {
+      if (pills.has(c)) { place(c); return; }
+      pills.add(c);
+      place(c);
+      new MutationObserver(() => place(c)).observe(c, { attributes: true, subtree: true, attributeFilter: ["class", "aria-current"] });
+    });
+  }
+  const startWatch = () => { watch(); new MutationObserver(watch).observe(document.body, { childList: true }); };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startWatch); else startWatch();
+  window.addEventListener("resize", () => pills.forEach(place));
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => pills.forEach(place));
+  window.addEventListener("load", () => pills.forEach(place));
+
+  // soft page change: fade out, then go (skipped for new tabs, downloads, hash-only links, modifier clicks)
+  if (!reduce) {
+    document.addEventListener("click", (e) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const a = e.target.closest && e.target.closest("a[href]");
+      if (!a || a.target === "_blank" || a.hasAttribute("download")) return;
+      const url = new URL(a.href, location.href);
+      if (url.origin !== location.origin || (url.pathname === location.pathname && url.search === location.search)) return;
+      e.preventDefault();
+      document.body.classList.add("d2-leave");
+      setTimeout(() => { location.href = url.href; }, 150);
+    });
+    window.addEventListener("pageshow", () => document.body.classList.remove("d2-leave"));
+  }
 })();

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import faulthandler
+import json
 import os
 import re
 import threading
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,7 @@ from fresherpilot.core import search_config as cfg
 from fresherpilot.core import users
 from fresherpilot.jobs import visited
 from fresherpilot.outreach import websearch
-from fresherpilot.jobs.apify_jobs import fetch_latest_jobs, load_cache
+from fresherpilot.jobs.apify_jobs import fetch_latest_jobs, load_cache, load_cache_shared
 from fresherpilot.jobs.ranker import strip_html
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +80,104 @@ def _normalized_jobs(payload: dict | None) -> list[dict[str, Any]]:
         {**job, "title": strip_html(job.get("title") or ""), "description": strip_html(job.get("description") or "")}
         for job in (payload or {}).get("jobs") or []
     ]
+
+
+def _normalize_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {**job, "title": strip_html(job.get("title") or ""), "description": strip_html(job.get("description") or "")}
+
+
+def _jobs_by_uids(uids: set[str]) -> list[dict[str, Any]]:
+    """Only the wanted jobs, cleaned. Cleaning all ~24k (87 MB of descriptions) for one lookup cost 3-5 s per call."""
+    jobs = (load_cache_shared() or {}).get("jobs") or []
+    return [_normalize_job(j) for j in jobs if f"{j.get('source')}:{j.get('id')}" in uids]
+
+
+_RATED: dict[str, tuple[float, int, set[str]]] = {}
+
+
+def _unrated_jobs() -> list[dict[str, Any]]:
+    """Jobs the AI has not rated yet (cleaned). A job rated once stays rated until the search settings change or verdicts
+    are removed, so only new / unrated jobs are looked at again: a full pass over ~24k jobs cost ~6 s of CPU, every 20 s."""
+    uid = users.current() or ""
+    p = users.path("search_prefs.json")
+    stamp = p.stat().st_mtime if p.exists() else 0.0
+    n_verdicts = len(llm_filter._load_cache())
+    st = _RATED.get(uid)
+    if not st or st[0] != stamp or n_verdicts < st[1]:
+        st = (stamp, n_verdicts, set())
+    st = (st[0], n_verdicts, st[2])
+    _RATED[uid] = st
+    rated, out = st[2], []
+    for j in (load_cache_shared() or {}).get("jobs") or []:
+        key = f"{j.get('source')}:{j.get('id')}"
+        if key in rated:
+            continue
+        nj = _normalize_job(j)
+        if llm_filter.cached_verdict(nj) is None:
+            out.append(nj)
+        else:
+            rated.add(key)
+    return out
+
+
+_LAST_TRIM = 0.0
+TRIM_AFTER_DAYS = 4
+TRIM_TO_CHARS = 1500  # what duplicate detection compares (_same_post), so reposts still match
+
+
+def _trim_old_rejects(dry_run: bool = False) -> dict[str, int]:
+    """Shorten the description of jobs that are old, rejected and not opened by you: they were ~40% of the 100 MB jobs file,
+    which every list / autofill / AI-check pass had to load. The verdict key of the FULL text is stored as `_vk`
+    (llm_filter.job_key uses it), so no verdict is lost and nothing is re-checked."""
+    from fresherpilot.jobs import apify_jobs
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=TRIM_AFTER_DAYS)).isoformat()
+    seen_all = visited.load_all()
+    apps = applicant.applications()
+    done = saved = 0
+    with apify_jobs._CACHE_LOCK:
+        payload = apify_jobs.load_cache()
+        for j in (payload or {}).get("jobs") or []:
+            desc = j.get("description") or ""
+            if len(desc) <= TRIM_TO_CHARS + 200 or j.get("_vk") or (j.get("first_seen") or "9") >= cutoff:
+                continue
+            nj = _normalize_job(j)
+            v = llm_filter.cached_verdict(nj)
+            if not v or v.get("decision") == "keep" or visited.uid(j) in apps or visited.visited_at(nj, seen_all):
+                continue
+            key = llm_filter.job_key(nj)
+            short = {**j, "description": desc[:TRIM_TO_CHARS], "_vk": [llm_filter.PROMPT_VERSION, key]}
+            v2 = llm_filter.cached_verdict(_normalize_job(short))  # the rules also read the description: same answer or leave it whole
+            if not v2 or (v2.get("decision"), v2.get("category")) != (v.get("decision"), v.get("category")):
+                continue
+            j["description"] = short["description"]
+            j["_vk"] = short["_vk"]
+            j["description_trimmed"] = True
+            done += 1
+            saved += len(desc) - TRIM_TO_CHARS
+        if done and not dry_run:
+            users.write_atomic(apify_jobs._cache_path(), json.dumps(payload, indent=2))
+    return {"trimmed": done, "chars_saved": saved}
+
+
+_LIGHT: dict[str, Any] = {}
+
+
+def _light_jobs() -> list[dict[str, Any]]:
+    """Title / url / employer of every saved job (+ the raw job), rebuilt only when the jobs file was re-read."""
+    payload = load_cache_shared() or {}
+    hit = _LIGHT.get("hit")
+    if hit and hit[0] is payload:
+        return hit[1]
+    light = [{"source": j.get("source"), "id": j.get("id"), "url": j.get("url"), "title": strip_html(j.get("title") or ""),
+              "company": j.get("company"), "employer": contacts.resolve_company(j), "_raw": j} for j in payload.get("jobs") or []]
+    _LIGHT["hit"] = (payload, light)
+    return light
+
+
+def _job_by_uid_fast(uid: str) -> dict[str, Any] | None:
+    found = _jobs_by_uids({uid})
+    return found[0] if found else None
 
 
 # Jobs per AI step; results appear in the list after each step. 30, not 10: the free title rules drop
@@ -198,13 +298,13 @@ def _run_checker() -> None:
     try:
         reopened = llm_filter.reopen_stale_board_rejects(_normalized_jobs(load_cache()))
         if reopened:
+            _RATED.pop(users.current() or "", None)  # their verdicts were removed: look at every job again
             print(f"[ai check] {reopened} job(s) rejected for free under an older rule are re-opened for the AI", flush=True)
         while True:
             while autoapply.STATE.get("running"):  # auto-apply gets the AI quota first
                 _T()["check"].update(stage="paused_for_autoapply")
                 time.sleep(5)
-            jobs = _normalized_jobs(load_cache())
-            unchecked = [j for j in jobs if llm_filter.cached_verdict(j) is None and llm_filter.job_key(j) not in errors]
+            unchecked = [j for j in _unrated_jobs() if llm_filter.job_key(j) not in errors]
             if not unchecked:
                 break
             _T()["check"].update(stage="ai_check", total=checked + len(unchecked), done=checked)
@@ -219,6 +319,12 @@ def _run_checker() -> None:
             errors.update(_check_parallel(batch, chunk_done))
             checked += len(batch)
             _T()["check"].update(done=checked)
+        global _LAST_TRIM
+        if time.time() - _LAST_TRIM > 6 * 3600:  # old rejected jobs keep only the first 1500 characters
+            _LAST_TRIM = time.time()
+            trimmed = _trim_old_rejects()
+            if trimmed["trimmed"]:
+                print(f"[jobs file] shortened {trimmed['trimmed']} old rejected job(s), {trimmed['chars_saved'] // 1_000_000} MB less", flush=True)
         if errors:
             _T()["check"]["error"] = f"AI check failed for {len(errors)} job(s); they stay 'Pending AI check' and are retried later."
         seen_all = visited.load_all()
@@ -227,7 +333,7 @@ def _run_checker() -> None:
         if approved_new:
             _prefetch_contacts(approved_new)
     except llm_filter.DailyLimitReached:
-        left = sum(1 for j in _normalized_jobs(load_cache()) if llm_filter.cached_verdict(j) is None)
+        left = len(_unrated_jobs())
         _T()["check"]["error"] = (f"Every AI key is used up or busy right now. {left} job(s) stay 'Pending AI check' and are "
                            "checked again in 5 minutes.")
         # 5 min, not 30: this is also raised when every key is only busy for the minute (alerts must not wait 30 min)
@@ -875,7 +981,7 @@ def cached_jobs(slim: bool = False) -> dict:
     # Unchecked jobs (new, or left over when Groq's daily limit ran out) start the checker; after a
     # quota error it waits 30 minutes before trying again.
     if (payload and not _T()["check"]["running"] and not os.getenv("JF_NO_AUTOCHECK")
-            and any(llm_filter.cached_verdict(j) is None for j in _normalized_jobs(payload))):
+            and _unrated_jobs()):
         _start_checker()
     result = _pack(payload, slim)
     for k in [k for k in _PACK_MEMO if k[0] == key[0] and k[-1] == slim]:
@@ -887,7 +993,7 @@ def cached_jobs(slim: bool = False) -> dict:
 @app.get("/api/job/description")
 def job_description(uid: str) -> dict:
     """Full text of one job (the list sends rejected jobs without it)."""
-    job = next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == uid), None)
+    job = _job_by_uid_fast(uid)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found in the latest fetch")
     return {"uid": uid, "description": job.get("description") or ""}
@@ -996,7 +1102,7 @@ def report_missed(body: dict) -> dict:
 @app.get("/api/contacts")
 def job_contacts(uid: str, refresh: bool = False) -> dict:
     """People / emails / phones to reach out to for one job (searches the web if not cached)."""
-    job = next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == uid), None)
+    job = _job_by_uid_fast(uid)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found in the latest fetch")
     if refresh:
@@ -1014,7 +1120,7 @@ class VisitedRequest(BaseModel):
 @app.post("/api/visited")
 def set_visited(body: VisitedRequest) -> dict:
     wanted = set(body.uids)
-    jobs = [j for j in _normalized_jobs(load_cache()) if visited.uid(j) in wanted]
+    jobs = _jobs_by_uids(wanted)
     return {"updated": visited.mark(jobs, body.visited)}
 
 
@@ -1022,7 +1128,7 @@ def set_visited(body: VisitedRequest) -> dict:
 
 
 def _job_by_uid(uid: str) -> dict[str, Any]:
-    job = next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == uid), None)
+    job = _job_by_uid_fast(uid)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found in the saved list")
     job["employer"] = contacts.resolve_company(job)
@@ -1080,18 +1186,38 @@ def _recently_opened(url: str, page_text: str, jobs: list[dict[str, Any]]) -> di
 @app.post("/api/autofill")
 def autofill(body: AutofillRequest) -> dict:
     """Answers for the fields of an application form (sent by the browser extension)."""
-    jobs = _normalized_jobs(load_cache())
-    for j in jobs:
-        j["employer"] = contacts.resolve_company(j)
-    job = next((j for j in jobs if visited.uid(j) == body.uid), None) if body.uid else None
-    job = job or applicant.find_job(body.url, f"{body.title}\n{body.page_text}", jobs)
-    job = job or _recently_opened(body.url, f"{body.title}\n{body.page_text}", jobs)
+    # Light list (title, url, employer only): the page's job is matched on that, then ONLY that job is cleaned in full.
+    light = _light_jobs()
+    page = body.title + chr(10) + body.page_text
+    hit = next((j for j in light if visited.uid(j) == body.uid), None) if body.uid else None
+    hit = hit or applicant.find_job(body.url, page, light)
+    if not hit:  # the job opened in the last 3 h: its own id/title key is in the visited store (only those few are cleaned)
+        seen = visited.load_all()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        recent = [_normalize_job(j["_raw"]) | {"employer": j["employer"]} for j in light
+                  if (seen.get(visited.uid(j)) or seen.get(visited._alt(j)) or "") >= cutoff]
+        found = _recently_opened(body.url, page, recent)
+        hit = next((j for j in light if visited.uid(j) == visited.uid(found)), None) if found else None
+    job = None
+    if hit:
+        job = _normalize_job(hit["_raw"])
+        job["employer"] = hit["employer"]
     if job:
         context = applicant.job_header(job) + (job.get("description") or "")[:4000]
     else:
         context = (f"(The exact job is unknown: do NOT state a role or company name unless the page text below says it.)\n"
                    f"Page: {body.title}\n{body.url}\n{body.page_text[:4000]}")
     answers = applicant.autofill(body.fields, context, job)
+    try:  # audit trail (local only): what was typed into which question, so wrong answers can be spotted and fixed
+        import json as _json
+        by_id = {f.get("id"): f for f in body.fields}
+        rows = [{"label": str((by_id.get(a.get("id")) or {}).get("label", ""))[:110], "type": (by_id.get(a.get("id")) or {}).get("type"),
+                 "value": str(a.get("value", ""))[:160], "source": a.get("source"), "review": bool(a.get("needs_review"))} for a in answers]
+        with open(users.path("autofill_audit.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps({"at": datetime.now(timezone.utc).isoformat(), "job": (job or {}).get("title"), "company": (job or {}).get("employer") or (job or {}).get("company"),
+                                  "host": body.url.split("/")[2] if "//" in body.url else "", "answers": rows}, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - never break an application over logging
+        pass
     instructions = (llm_filter.cached_verdict(job) or {}).get("apply_instructions") if job else None
     return {
         "answers": answers,
@@ -1240,11 +1366,20 @@ def extension_version() -> dict:
 
 
 @app.get("/api/autoapply/pending")
-def autoapply_pending() -> dict:
-    """The extension pulls a started run it has not got yet (it asks every ~30 s), so Start works without a page."""
+def autoapply_pending(wait: float = 0) -> dict:
+    """The extension pulls a started run it has not got yet, so Start works without a page. With ?wait=N the request is
+    held up to N s (max 25) until a run is pending: the extension keeps one such request open, so a run starts at once
+    instead of after the next 30 s alarm (Nov 18: ~25-30 s of every job was waiting for that alarm)."""
+    import time as _time
+
     from fresherpilot.apply import autoapply
 
-    return {"start": autoapply.take_pending()}
+    end = _time.time() + max(0.0, min(float(wait), 25.0))
+    while True:
+        got = autoapply.take_pending()
+        if got or _time.time() >= end:
+            return {"start": got}
+        _time.sleep(0.25)
 
 
 @app.post("/api/autoapply/decide")
@@ -1375,7 +1510,7 @@ class OutreachEvent(BaseModel):
 @app.post("/api/outreach/event")
 def outreach_event(body: OutreachEvent) -> dict:
     """Result of one WhatsApp message, reported by the extension."""
-    job = next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == body.uid), {})
+    job = (_job_by_uid_fast(body.uid) or {})
     return outreach.record(body.uid, body.channel, body.to, body.ok, body.error,
                            contacts.resolve_company(job) if job else "", job.get("title", ""))
 
@@ -1396,7 +1531,7 @@ def _unchecked_count() -> int:
     memo = _UNCHECKED_MEMO.get(uid)
     if memo and memo[0] == key:
         return memo[1]
-    n = sum(1 for j in _normalized_jobs(load_cache()) if llm_filter.cached_verdict(j) is None)
+    n = len(_unrated_jobs())
     _UNCHECKED_MEMO[uid] = (key, n)
     return n
 
@@ -1496,6 +1631,10 @@ def _autostart() -> None:
         _start_checker()
         users.thread(_ai_consumer)  # independent AI stage (see _ai_consumer)
         users.thread(lambda: cached_jobs(True))  # warm the packed job list so the first page load is not a 9 s wait
+        from fresherpilot.apply import site_apply
+
+        if site_apply.start_mailwatch():  # verification codes from your Gmail -> Telegram (+ the apply runner's inbox)
+            print("[mail watcher] forwarding verification-code emails to Telegram", flush=True)
 
     threading.Thread(target=start, daemon=True).start()
 

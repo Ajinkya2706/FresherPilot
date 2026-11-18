@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FresherPilot System Map</title>
+<style>
+:root{
+  --bg:#f6f7f9;--panel:#ffffff;--ink:#14181f;--muted:#5b6575;--line:#c9d0db;--accent:#2563eb;
+  --src:#dbeafe;--src-b:#3b82f6;--cloud:#ffedd5;--cloud-b:#f97316;--ai:#ede9fe;--ai-b:#8b5cf6;
+  --out:#dcfce7;--out-b:#16a34a;--local:#fef9c3;--local-b:#ca8a04;--ext:#fce7f3;--ext-b:#db2777;
+  --bad:#fee2e2;--bad-b:#dc2626;--store:#e2e8f0;--store-b:#64748b;--shadow:0 1px 3px rgba(0,0,0,.08);
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0e1117;--panel:#161b24;--ink:#e6eaf2;--muted:#9aa5b8;--line:#344055;--accent:#60a5fa;
+  --src:#13264a;--src-b:#3b82f6;--cloud:#3b2410;--cloud-b:#fb923c;--ai:#271f4a;--ai-b:#a78bfa;
+  --out:#10301d;--out-b:#22c55e;--local:#3a3210;--local-b:#eab308;--ext:#3d1630;--ext-b:#f472b6;
+  --bad:#3b1414;--bad-b:#f87171;--store:#232c3b;--store-b:#94a3b8;--shadow:none}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{padding:28px 16px 8px;max-width:1180px;margin:0 auto}
+h1{margin:0 0 4px;font-size:28px}
+header p{margin:0;color:var(--muted);max-width:820px}
+nav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+nav .in{max-width:1180px;margin:0 auto;padding:8px 16px;display:flex;gap:6px;flex-wrap:wrap}
+nav button{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 12px;border-radius:999px;cursor:pointer;font:inherit;font-size:13.5px}
+nav button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+main{max-width:1180px;margin:0 auto;padding:16px}
+section{display:none}
+section.on{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:0 0 16px;box-shadow:var(--shadow)}
+h2{margin:0 0 4px;font-size:21px}
+h3{margin:18px 0 6px;font-size:16px}
+.lead{color:var(--muted);margin:0 0 12px}
+.dia{overflow-x:auto}
+.dia svg{display:block;min-width:760px;width:100%;height:auto}
+.node rect{stroke-width:1.6;rx:9}
+.node text{fill:var(--ink);font-size:13px;pointer-events:none}
+.node .t{font-weight:650}
+.node .s{font-size:11px;fill:var(--muted)}
+.c-src rect{fill:var(--src);stroke:var(--src-b)}
+.c-cloud rect{fill:var(--cloud);stroke:var(--cloud-b)}
+.c-ai rect{fill:var(--ai);stroke:var(--ai-b)}
+.c-out rect{fill:var(--out);stroke:var(--out-b)}
+.c-local rect{fill:var(--local);stroke:var(--local-b)}
+.c-ext rect{fill:var(--ext);stroke:var(--ext-b)}
+.c-bad rect{fill:var(--bad);stroke:var(--bad-b)}
+.c-store rect{fill:var(--store);stroke:var(--store-b)}
+.edge{fill:none;stroke:var(--muted);stroke-width:1.6;stroke-dasharray:6 5;animation:flow 1.2s linear infinite}
+.edge.solid{stroke-dasharray:none;animation:none}
+.edge.red{stroke:var(--bad-b)}
+.edge.back{stroke:var(--local-b)}
+@keyframes flow{to{stroke-dashoffset:-22}}
+@media (prefers-reduced-motion:reduce){.edge{animation:none}}
+.elabel{font-size:10.5px;fill:var(--muted);paint-order:stroke;stroke:var(--panel);stroke-width:4px}
+.zone{fill:none;stroke:var(--line);stroke-dasharray:3 4;stroke-width:1.3;rx:14}
+.zlabel{font-size:11.5px;fill:var(--muted);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.tbl{overflow-x:auto}
+.funnel .row{display:flex;align-items:stretch;gap:10px;margin:8px 0}
+.funnel .bar{flex:0 0 auto;padding:10px 14px;border-radius:9px;border:1.6px solid;min-height:48px}
+.funnel .bar b{display:block}
+.funnel .bar span{font-size:12.5px;color:var(--muted)}
+.funnel .note{flex:1;font-size:13px;color:var(--muted);align-self:center}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:6px 0 0}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;border:1.6px solid;margin-right:5px;vertical-align:-2px}
+.pill{display:inline-block;font-size:11.5px;padding:1px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin:0 3px 3px 0}
+code{background:var(--store);padding:1px 5px;border-radius:5px;font-size:12.5px}
+ul{margin:6px 0 6px 20px;padding:0}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:820px){.grid2{grid-template-columns:1fr}.funnel .row{flex-direction:column}}
+.steps{counter-reset:s;list-style:none;margin:8px 0 0;padding:0}
+.steps li{counter-increment:s;position:relative;padding:4px 0 4px 34px}
+.steps li::before{content:counter(s);position:absolute;left:0;top:3px;width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;text-align:center;font-size:12.5px;line-height:24px;font-weight:700}
+footer{max-width:1180px;margin:0 auto;padding:8px 16px 40px;color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>FresherPilot: system map</h1>
+  <p>How jobs arrive, how the AI decides, how alerts and button taps stay in sync, and how applications get sent. Dashed lines move data;
+  colours show where each part runs. Pick a view below.</p>
+</header>
+<nav><div class="in" id="tabs"></div></nav>
+<main>
+
+<!-- 1 OVERVIEW -->
+<section id="overview">
+  <div class="card">
+    <h2>The big picture</h2>
+    <p class="lead">Readers find jobs, the Cloudflare Worker checks them with AI and alerts you on Telegram, and your laptop app (when open) syncs, applies and does outreach.</p>
+    <div class="dia" id="d-overview"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>The four parts</h3>
+      <div class="tbl"><table>
+        <tr><th>Part</th><th>Runs on</th><th>Job</th></tr>
+        <tr><td>Reader</td><td>GitHub Actions</td><td>LinkedIn (2 machines) + Indeed, nonstop</td></tr>
+        <tr><td>Cloud</td><td>Cloudflare Worker + D1, cron each minute</td><td>other sources, AI check, alerts, bot, dashboard</td></tr>
+        <tr><td>Local app</td><td>your PC (manual)</td><td>list, sync, auto-apply, portal runner, outreach</td></tr>
+        <tr><td>Extension</td><td>your Chrome</td><td>autofill, board auto-apply, private channel</td></tr>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>What happens to one job</h3>
+      <ol class="steps">
+        <li>A reader finds it (LinkedIn, Indeed, Telegram, Naukri, ...).</li>
+        <li>It is stored in D1 as <code>new</code> if no source has seen it before.</li>
+        <li>Free rules, then AI title / facts / fit decide keep or reject.</li>
+        <li>Kept jobs get <b>one</b> Telegram alert (dedupe by fingerprint).</li>
+        <li>You tap Applied / Seen / Not for me, or auto-apply sends it.</li>
+        <li>Both sides sync, so Telegram <code>/dashboard</code> counts it.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<!-- 2 INTAKE -->
+<section id="intake">
+  <div class="card">
+    <h2>How jobs come in</h2>
+    <p class="lead">Every source, who reads it, and how often. All of them end in the same D1 <code>jobs</code> table.</p>
+    <div class="dia" id="d-intake"></div>
+  </div>
+  <div class="card">
+    <h3>Schedule</h3>
+    <div class="tbl"><table>
+      <tr><th>Source</th><th>Read by</th><th>Every</th><th>Notes</th></tr>
+      <tr><td>LinkedIn</td><td>GitHub reader, machines li0 + li1</td><td>~2 min</td><td>40 searches split in half, guest pages, 2.5 s pace, window = since last read + 10 min; "Remote" searches get <code>Remote, </code> prefix</td></tr>
+      <tr><td>Indeed</td><td>GitHub reader, machine indeed</td><td>3-4 min</td><td>python-jobspy, all roles x places</td></tr>
+      <tr><td>Telegram channels</td><td>Worker</td><td>1 min</td><td>newest post number first; full read when it changes or every 30 min; promo / ad links dropped; blog posts resolved to the official apply link</td></tr>
+      <tr><td>Naukri</td><td>Worker via Apify</td><td>~4 min</td><td>search terms rotate hourly; budget capped per day; internships dropped</td></tr>
+      <tr><td>Internshala</td><td>Worker</td><td>4 min</td><td>public pages</td></tr>
+      <tr><td>Wellfound, career pages</td><td>Worker</td><td>8 min</td><td>44 company ATS boards: Greenhouse, Lever, Ashby, SmartRecruiters</td></tr>
+      <tr><td>Private Pro channel</td><td>Extension (Telegram Web tab) to laptop</td><td>live</td><td>needs laptop + Chrome open</td></tr>
+      <tr><td>Fetch new jobs</td><td>Laptop</td><td>on demand</td><td>every board once + one LinkedIn round + Naukri; range latest / 1 / 3 / 24 h / all</td></tr>
+    </table></div>
+    <h3>Cron tick, every minute (Worker)</h3>
+    <ol class="steps">
+      <li>Cheap Telegram "new post?" check.</li>
+      <li>One source step from the 8-minute cycle (a new Telegram post takes its place).</li>
+      <li>Every 10 minutes: start the GitHub reader if none is waiting.</li>
+      <li>One AI step (up to 10 jobs) and up to 6 alerts.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- 3 FILTER -->
+<section id="filter">
+  <div class="card">
+    <h2>How a job is judged</h2>
+    <p class="lead">Cheap free rules first, AI only when needed. Each stage can drop a job; the reason is recorded and shown in <code>/status</code>.</p>
+    <div class="funnel" id="funnel"></div>
+  </div>
+  <div class="card">
+    <h2>AI provider chain</h2>
+    <div class="dia" id="d-ai"></div>
+    <ul>
+      <li>A per-minute 429 only cools that key + model; a daily limit or 401 marks the key out for 30 minutes; all keys out pauses the checker 5 minutes.</li>
+      <li>The second look goes NVIDIA-first (a different model family, saves Groq tokens).</li>
+      <li>Duplicate postings reuse an earlier answer (same title + company, description 85% alike, within 7 days).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- 4 SYNC -->
+<section id="sync">
+  <div class="card">
+    <h2>Alerts and two-way sync</h2>
+    <p class="lead">The cloud is the source of truth for alerts and button taps. The laptop app, while open, syncs about every 40 seconds.</p>
+    <div class="dia" id="d-sync"></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Why only one alert per opening</h3>
+      <ul>
+        <li>D1 <code>claims</code> keeps fingerprints (company + title words, description hash) of jobs you were shown, for 30 days.</li>
+        <li>A repost in that window gets an alert row with state <code>dup</code>; jobs older than 30 hours get <code>old</code>.</li>
+        <li>Approved jobs without an alert row from the last day are retried.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>What /dashboard counts</h3>
+      <ul>
+        <li>Every job in D1 <code>applied</code> today (IST): Telegram taps, auto-apply, marks from the app's list.</li>
+        <li>Priority = company on the target list (IBM, NTT DATA, Cognizant, ...).</li>
+        <li>Alerts sent, seen, still unmarked, last 7 days and today's list.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 5 APPLY -->
+<section id="apply">
+  <div class="card">
+    <h2>Pipeline A: Easy Apply on the board (extension)</h2>
+    <p class="lead">LinkedIn Easy Apply, Naukri, Indeed, Wellfound and Internshala. The extension drives your own logged-in Chrome.</p>
+    <div class="dia" id="d-applyA"></div>
+  </div>
+  <div class="card">
+    <h2>Pipeline B: company portals (laptop runner)</h2>
+    <p class="lead">Greenhouse, Lever, Ashby, Workday, Taleo and similar. A real Chrome window, an AI planner with guard rails, and a per-job memory.</p>
+    <div class="dia" id="d-applyB"></div>
+    <div class="grid2">
+      <div>
+        <h3>Guard rails</h3>
+        <ul>
+          <li><code>check_plan</code> refuses unknown ids, Cancel / Back / Delete, Next / Submit with empty required fields, skills the resume doesn't support.</li>
+          <li>Attempt ledger per portal per 24 h: sign-ins 2, reset mails 1, code mails 6.</li>
+          <li>CAPTCHA and Cloudflare checks are never solved: the job waits for you.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Submit policy (<code>site_submit</code>)</h3>
+        <ul>
+          <li><b>verified</b>: Greenhouse, Lever, Ashby are submitted; others are filled and left open.</li>
+          <li><b>all</b>: submit everywhere. <b>never</b>: always leave for you.</li>
+          <li>After "needs you" the runner stays alive and continues in the same window when you answer.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Special instructions in a post</h3>
+    <div class="tbl"><table>
+      <tr><th>The post says</th><th>What happens</th></tr>
+      <tr><td>"Email your CV to ... with subject ..."</td><td>Sent from your Gmail: resume attached, AI-written message, only to an address really in the post, placeholders blocked</td></tr>
+      <tr><td>A Google / Microsoft form link</td><td>Form filled, extension waits for you to submit</td></tr>
+      <tr><td>Anything else unusual</td><td>Normal flow; set aside as "needs you" if blocked</td></tr>
+    </table></div>
+    <h3>Routing</h3>
+    <p>Every job is classified <span class="pill">easy</span><span class="pill">site</span><span class="pill">needs_check</span> from evidence (board field, then link host / ATS, then board default). Alerts show 📱 Easy Apply or 💻 Company site.</p>
+  </div>
+</section>
+
+<!-- 6 DATA -->
+<section id="data">
+  <div class="card">
+    <h2>Where data lives</h2>
+    <div class="dia" id="d-data"></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Cloud (D1)</h3>
+      <div class="tbl"><table>
+        <tr><th>Table</th><th>Holds</th></tr>
+        <tr><td><code>seen</code></td><td>known job IDs (45 days)</td></tr>
+        <tr><td><code>jobs</code></td><td>jobs + status new / keep / reject, facts, fit (21 days)</td></tr>
+        <tr><td><code>claims</code></td><td>shown-job fingerprints (30 days)</td></tr>
+        <tr><td><code>alerts</code></td><td>alert text and state</td></tr>
+        <tr><td><code>actions</code></td><td>button taps for the laptop</td></tr>
+        <tr><td><code>applied</code></td><td>one row per applied job, real time (for /dashboard)</td></tr>
+        <tr><td><code>state</code></td><td>timestamps, switches, budgets</td></tr>
+        <tr><td><code>ai_usage</code></td><td>tokens per day / model / key / step</td></tr>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Laptop (<code>users/&lt;id&gt;/</code>, git-ignored)</h3>
+      <div class="tbl"><table>
+        <tr><th>File</th><th>Holds</th></tr>
+        <tr><td><code>jobs_cache.json</code></td><td>all jobs</td></tr>
+        <tr><td><code>llm_verdicts.json</code></td><td>AI verdict cache</td></tr>
+        <tr><td><code>visited.json</code>, <code>applications.json</code></td><td>what you opened / applied</td></tr>
+        <tr><td><code>applicant_profile.json</code></td><td>profile, education, work history, answers</td></tr>
+        <tr><td><code>autoapply_*.jsonl/json</code></td><td>log, steps, choices</td></tr>
+        <tr><td><code>site_*</code></td><td>portal accounts, memory, ledger, sessions, commands</td></tr>
+        <tr><td><code>keys.enc</code></td><td>encrypted API keys</td></tr>
+      </table></div>
+    </div>
+  </div>
+</section>
+
+<!-- 7 LIMITS -->
+<section id="limits">
+  <div class="card">
+    <h2>Free-tier limits that shape the design</h2>
+    <div class="tbl"><table>
+      <tr><th>Service</th><th>Limit</th><th>Design response</th></tr>
+      <tr><td>Cloudflare Worker</td><td>~10 ms CPU, ~45 sub-requests per run</td><td>one source per minute; Telegram checked by newest post number first</td></tr>
+      <tr><td>Cloudflare D1</td><td>5M reads / 100k writes per day</td><td>metered queries, indexes, <code>/status</code> shows budget, warning above 60%</td></tr>
+      <tr><td>LinkedIn</td><td>~1 request / 2.5 s per IP</td><td>reader split over two machines</td></tr>
+      <tr><td>Groq</td><td>200k tokens/day per model per key; 8k/min</td><td>several keys, NVIDIA fallback, free rules before AI, answer reuse</td></tr>
+      <tr><td>NVIDIA</td><td>~10 requests/min per key</td><td>keys rotated, burst workers only for backlogs</td></tr>
+      <tr><td>Apify</td><td>$5/month</td><td>Naukri only, daily share, per-run cap</td></tr>
+      <tr><td>GitHub Actions</td><td>free on public repos</td><td>3 machines per run, looped ~340 min, re-dispatched every 10 min</td></tr>
+    </table></div>
+  </div>
+</section>
+
+</main>
+<footer>Source: <code>README.md</code> and <code>docs/ARCHITECTURE.md</code>. Update both together when the pipeline changes.</footer>
+
+<script>
+(function(){
+  var NS="http://www.w3.org/2000/svg";
+  function el(n,a,p){var e=document.createElementNS(NS,n);for(var k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e}
+  // box edge point toward target
+  function edgePt(n,tx,ty){
+    var cx=n.x+n.w/2,cy=n.y+n.h/2,dx=tx-cx,dy=ty-cy;
+    if(!dx&&!dy)return[cx,cy];
+    var sx=dx?(n.w/2)/Math.abs(dx):1e9,sy=dy?(n.h/2)/Math.abs(dy):1e9,s=Math.min(sx,sy);
+    return[cx+dx*s,cy+dy*s];
+  }
+  function diagram(id,W,H,zones,nodes,edges){
+    var host=document.getElementById(id);
+    var svg=el("svg",{viewBox:"0 0 "+W+" "+H,role:"img"});
+    var defs=el("defs",{},svg);
+    ["","red","back"].forEach(function(c){
+      var m=el("marker",{id:"ar"+id+c,viewBox:"0 0 10 10",refX:9,refY:5,markerWidth:7,markerHeight:7,orient:"auto-start-reverse"},defs);
+      el("path",{d:"M0 0L10 5L0 10z",fill:c==="red"?"var(--bad-b)":c==="back"?"var(--local-b)":"var(--muted)"},m);
+    });
+    (zones||[]).forEach(function(z){
+      el("rect",{x:z[0],y:z[1],width:z[2],height:z[3],"class":"zone"},svg);
+      var t=el("text",{x:z[0]+12,y:z[1]+17,"class":"zlabel"},svg);t.textContent=z[4];
+    });
+    var map={};nodes.forEach(function(n){map[n.id]=n});
+    edges.forEach(function(e){
+      var a=map[e[0]],b=map[e[1]],opt=e[3]||{};
+      var ac=[a.x+a.w/2,a.y+a.h/2],bc=[b.x+b.w/2,b.y+b.h/2];
+      var p1=edgePt(a,bc[0],bc[1]),p2=edgePt(b,ac[0],ac[1]);
+      var mx=(p1[0]+p2[0])/2,my=(p1[1]+p2[1])/2;
+      var d="M"+p1[0]+" "+p1[1]+(opt.bend?" Q"+(mx+opt.bend[0])+" "+(my+opt.bend[1])+" ":" L")+p2[0]+" "+p2[1];
+      var cls="edge"+(opt.solid?" solid":"")+(opt.k?" "+opt.k:"");
+      var p=el("path",{d:d,"class":cls,"marker-end":"url(#ar"+id+(opt.k||"")+")"},svg);
+      if(e[2]){
+        var lx=mx+(opt.bend?opt.bend[0]/2:0),ly=my+(opt.bend?opt.bend[1]/2:0);
+        var t=el("text",{x:lx,y:ly-4,"text-anchor":"middle","class":"elabel"},svg);t.textContent=e[2];
+      }
+    });
+    nodes.forEach(function(n){
+      var g=el("g",{"class":"node c-"+n.c},svg);
+      el("rect",{x:n.x,y:n.y,width:n.w,height:n.h},g);
+      var lines=n.s?String(n.s).split("|"):[];
+      var ty=n.y+(lines.length?n.h/2-(lines.length*6.5):n.h/2)+4;
+      var t=el("text",{x:n.x+n.w/2,y:ty,"text-anchor":"middle","class":"t"},g);t.textContent=n.t;
+      lines.forEach(function(l,i){
+        var s=el("text",{x:n.x+n.w/2,y:ty+15+i*13,"text-anchor":"middle","class":"s"},g);s.textContent=l;
+      });
+    });
+    host.appendChild(svg);
+  }
+  function N(id,x,y,w,h,c,t,s){return{id:id,x:x,y:y,w:w,h:h,c:c,t:t,s:s}}
+
+  // legend
+  var leg=[["src","Source / external site"],["cloud","Cloudflare Worker / D1"],["ai","AI"],["out","Output you see"],["local","Laptop app"],["ext","Browser extension"],["store","Data store"],["bad","Dropped / blocked"]];
+  document.getElementById("legend").innerHTML=leg.map(function(l){
+    return '<span><i style="background:var(--'+l[0]+');border-color:var(--'+l[0]+'-b)"></i>'+l[1]+'</span>';}).join("");
+
+  // 1 overview
+  diagram("d-overview",1120,520,
+   [[10,30,300,470,"Sources"],[330,30,430,470,"24/7 cloud (your PC can be off)"],[780,30,330,470,"You"]],
+   [
+    N("li",30,60,120,56,"src","LinkedIn","40 searches"),
+    N("in",170,60,120,56,"src","Indeed","all roles"),
+    N("gh",100,150,130,56,"cloud","GitHub reader","3 machines"),
+    N("tg",30,250,120,56,"src","Telegram","channels"),
+    N("nk",170,250,120,56,"src","Naukri","via Apify"),
+    N("ot",30,340,120,56,"src","Internshala","Wellfound"),
+    N("ca",170,340,120,56,"src","Career pages","44 ATS boards"),
+    N("wk",370,150,150,70,"cloud","Worker","cron each minute|/api/ingest"),
+    N("d1",570,150,150,70,"store","D1 database","jobs, claims, alerts"),
+    N("ai",470,280,170,70,"ai","AI check","rules, title, facts,|fit, second look"),
+    N("al",470,400,170,60,"out","Alert builder","one per opening"),
+    N("bot",810,60,140,60,"out","Telegram","alerts + buttons"),
+    N("dash",960,60,130,60,"out","Dashboard","/app password"),
+    N("app",810,190,280,70,"local","Local app (when open)","list, sync every 40 s, profile,|auto-apply, outreach"),
+    N("ex",810,300,130,60,"ext","Extension","autofill, Easy Apply"),
+    N("pr",960,300,130,60,"local","Portal runner","company sites"),
+    N("us",880,420,170,56,"out","You","tap Applied / Seen")
+   ],
+   [["li","gh"],["in","gh"],["gh","wk","ingest"],["tg","wk"],["nk","wk"],["ot","wk"],["ca","wk"],
+    ["wk","d1",""],["d1","ai","status new"],["ai","al","keep"],["al","bot","alert"],["wk","dash",""],
+    ["bot","us","",{bend:[40,0]}],["us","bot","taps",{bend:[-50,0],k:"back"}],
+    ["d1","app","jobs + verdicts",{bend:[40,-30]}],["app","d1","marks applied",{k:"back",bend:[-10,40]}],
+    ["app","ex"],["app","pr"]]);
+
+  // 2 intake
+  diagram("d-intake",1120,470,
+   [[10,30,230,420,"Sources"],[260,30,330,420,"Readers"],[610,30,230,420,"Cloud"],[860,30,250,420,"Free rules (instant drops)"]],
+   [
+    N("li",30,60,190,48,"src","LinkedIn","guest search"),
+    N("in",30,120,190,48,"src","Indeed","jobspy"),
+    N("tg",30,180,190,48,"src","Telegram channels","t.me/s/..."),
+    N("nk",30,240,190,48,"src","Naukri","Apify feed"),
+    N("is",30,300,190,48,"src","Internshala / Wellfound",""),
+    N("ca",30,360,190,48,"src","Career pages","Greenhouse / Lever ..."),
+    N("gh",290,80,250,70,"cloud","GitHub Actions","li0 + li1 (LinkedIn), indeed|dispatched every 10 min"),
+    N("wk",290,230,250,100,"cloud","Worker steps","Telegram 1 min, Apify 2/4 min,|Internshala 4, Wellfound + careers 8"),
+    N("pro",290,370,250,56,"ext","Pro channel (optional)","extension tgwatch to laptop"),
+    N("ing",640,100,170,56,"cloud","/api/ingest",""),
+    N("d1",640,230,170,70,"store","D1 jobs","status = new"),
+    N("r",890,70,190,56,"bad","City, blocklist, foreign",""),
+    N("r2",890,140,190,56,"bad","Title: senior / intern / off-stack",""),
+    N("r3",890,210,190,56,"bad","Board years >= 1, > 3 days old",""),
+    N("r4",890,280,190,56,"bad","Text states >= 3 yrs, no fresher",""),
+    N("nx",890,370,190,56,"ai","To the AI step","survivors only")
+   ],
+   [["li","gh"],["in","gh"],["tg","wk"],["nk","wk"],["is","wk"],["ca","wk"],["gh","ing","POST"],["wk","d1"],["ing","d1"],["d1","r"],["r","r2",""],["r2","r3",""],["r3","r4",""],["r4","nx","",{solid:true}],["pro","d1","via app",{bend:[20,30]}]]);
+
+  // AI chain
+  diagram("d-ai",1120,170,null,
+   [
+    N("a",20,50,170,66,"ai","Groq 120b","every key in turn"),
+    N("b",235,50,170,66,"ai","Groq 20b","fast, short fields"),
+    N("c",450,50,200,66,"ai","NVIDIA","nemotron-ultra, lightning,|minimax (3 keys)"),
+    N("d",695,50,170,66,"ai","Groq qwen","last resort"),
+    N("e",910,50,190,66,"out","Verdict","facts, fit, reason")
+   ],
+   [["a","b","limit / 429"],["b","c","limit / 429"],["c","d","timeout"],["d","e","",{solid:true}]]);
+
+  // 4 sync
+  diagram("d-sync",1120,520,
+   [[10,30,260,470,"Telegram"],[300,30,330,470,"Cloudflare Worker + D1"],[660,30,450,470,"Laptop app + Chrome"]],
+   [
+    N("ph",30,70,220,56,"out","Your phone","alert with buttons"),
+    N("bt",30,170,220,56,"out","Bot commands","/dashboard /jobs /status"),
+    N("wh",330,70,270,56,"cloud","Webhook /tg/secret","buttons + commands"),
+    N("al",330,170,270,56,"cloud","alerts + claims","dedupe 30 days"),
+    N("ac",330,270,270,56,"store","actions + applied","taps and applied jobs"),
+    N("jb",330,370,270,56,"store","jobs + verdicts","status keep / reject"),
+    N("cs",700,70,370,56,"local","cloud_sync (every ~40 s)","heartbeat (passive)"),
+    N("pj",700,170,370,56,"local","pull jobs + AI verdicts","no second AI check"),
+    N("pa",700,270,370,56,"local","pull button taps","mark visited / applied"),
+    N("pm",700,370,370,56,"local","push marks","applied with real time, opened"),
+    N("au",700,450,370,40,"ext","auto-apply / list buttons","also mark applied")
+   ],
+   [["al","ph","alert",{solid:true,bend:[-10,-60]}],["ph","wh","tap",{bend:[0,-30],k:"back"}],["bt","wh","command",{k:"back",bend:[10,10]}],["wh","ac","write"],["wh","al","state"],
+    ["jb","pj","",{bend:[0,0]}],["ac","pa","",{bend:[0,0]}],["pm","ac","/api/mark",{k:"back",bend:[0,0]}],["cs","wh","",{bend:[0,0]}],["au","pm","",{solid:true}]]);
+
+  // 5 apply A
+  diagram("d-applyA",1120,330,null,
+   [
+    N("q",20,40,160,70,"local","Auto-apply page","pick boards / jobs|or alert button"),
+    N("s",215,40,170,70,"local","Server start()","eligible jobs, closed|check, queue"),
+    N("p",420,40,160,70,"ext","Extension","long poll /pending"),
+    N("pb",615,40,170,70,"ext","Board playbook","LinkedIn, Naukri, Indeed,|Wellfound, Internshala"),
+    N("f",820,40,150,70,"ext","Fill + Submit","profile, answer bank, AI"),
+    N("ok",1000,40,100,70,"out","Applied","verified"),
+    N("pk",420,200,200,70,"bad","Parked: needs you","CAPTCHA, sign-in, answers"),
+    N("sk",660,200,200,70,"bad","Skipped","closed, already applied,|limit reached"),
+    N("lg",900,200,200,70,"store","Log + marks","applications.json, then|Telegram /dashboard")
+   ],
+   [["q","s"],["s","p","payload"],["p","pb"],["pb","f"],["f","ok","",{solid:true}],["pb","pk",""],["pb","sk",""],["ok","lg","",{bend:[10,50]}]]);
+
+  // 5 apply B
+  diagram("d-applyB",1120,430,null,
+   [
+    N("t",20,40,150,66,"local","Job link","company / ATS page"),
+    N("sa",200,40,170,66,"local","site_apply queue","one Chrome window|per job (Playwright)"),
+    N("sn",400,40,160,66,"ext","snap.py","fields, buttons, errors,|dialogs, shadow DOM"),
+    N("cl",590,40,160,66,"ext","classify.py","signin, create account,|OTP, form, submitted..."),
+    N("rl",780,40,150,66,"cloud","Rules","known states"),
+    N("pl",960,40,150,66,"ai","AI planner","plan.py: batch of|actions"),
+    N("ck",780,170,150,60,"bad","check_plan","guard rails"),
+    N("ac",590,170,160,60,"ext","actions.py","trusted clicks, fill,|upload, dropdowns"),
+    N("mem",960,170,150,60,"store","Portal memory","facts, history, ledger"),
+    N("ac2",400,170,160,60,"cloud","Accounts","derived password,|saved session 12 h"),
+    N("ml",200,170,170,60,"cloud","Gmail / Telegram","verification codes"),
+    N("sb",200,300,170,66,"out","Submit","verified portals|(Greenhouse, Lever, Ashby)"),
+    N("lv",400,300,170,66,"bad","Left open","filled, waiting for you"),
+    N("dn",600,300,170,66,"out","Result","applied marked + synced")
+   ],
+   [["t","sa"],["sa","sn"],["sn","cl"],["cl","rl"],["cl","pl","unknown / form"],["pl","ck"],["rl","ac"],["ck","ac","approved"],["ac","sn","re-observe",{bend:[0,-60]}],["pl","mem","",{bend:[0,0]}],
+    ["ac","ac2"],["ac2","ml","",{bend:[0,0]}],["ac","sb"],["ac","lv"],["sb","dn"]]);
+
+  // 6 data
+  diagram("d-data",1120,330,
+   [[10,30,350,280,"Cloud"],[380,30,360,280,"Laptop"],[760,30,350,280,"GitHub"]],
+   [
+    N("d1",30,60,150,56,"store","D1","jobs, alerts, claims"),
+    N("ap",200,60,140,56,"store","applied / actions","real times"),
+    N("sec",30,140,150,56,"store","Worker secrets","keys, tokens"),
+    N("cfg",200,140,140,56,"store","config.json","built from prefs"),
+    N("st",30,220,310,56,"store","state + ai_usage","timestamps, budgets, tokens"),
+    N("uj",400,60,160,56,"store","jobs + verdicts","jobs_cache, llm_verdicts"),
+    N("up",580,60,140,56,"store","profile + prefs","resume, answers"),
+    N("ua",400,140,160,56,"store","applied / visited","applications.json"),
+    N("us",580,140,140,56,"store","site_* files","accounts, memory"),
+    N("uk",400,220,320,56,"store","keys.enc","encrypted, per user"),
+    N("rp",780,60,310,56,"src","fresherpilot-reader repo","public, no personal data"),
+    N("ac",780,140,310,56,"cloud","Actions runs","~340 min loops"),
+    N("sc",780,220,310,56,"store","Repo secrets","cloud URL + secret")
+   ],
+   []);
+
+  // funnel
+  var F=[
+   ["src","All jobs read","LinkedIn, Indeed, Telegram, Naukri ...","Stored once per opening; known IDs are never read twice."],
+   ["bad","Free rules","city, blocklist, title words, board years, age, explicit 3+ yrs","No AI cost. About 34% of jobs skip the AI after the years rule. New rules are back-tested: zero approved jobs lost."],
+   ["ai","AI title screen","drops only clear cases","Cheap model, many titles per call."],
+   ["ai","AI facts then decide()","full-time, entry level, roles, years","The AI reads the post and returns facts; the rules are code. 'Freshers welcome' needs quoted evidence."],
+   ["ai","AI skill fit","strong / partial kept","Campus or mass hiring drives count as coding / partial."],
+   ["ai","Second look","every fit rejection, full post","Another model family; 'none' stacks stay rejected. Audit: ~2% wrong."],
+   ["out","Keep, one alert","fingerprint dedupe, under 30 h old","Telegram message + dashboard + local list."]
+  ];
+  document.getElementById("funnel").innerHTML=F.map(function(f,i){
+    var w=100-i*8;
+    return '<div class="row"><div class="bar" style="width:'+w+'%;max-width:420px;background:var(--'+f[0]+');border-color:var(--'+f[0]+'-b)"><b>'+(i+1)+'. '+f[1]+'</b><span>'+f[2]+'</span></div><div class="note">'+f[3]+'</div></div>';
+  }).join("");
+
+  // tabs
+  var tabs=[["overview","Big picture"],["intake","Job intake"],["filter","AI filter"],["sync","Alerts & sync"],["apply","Applying"],["data","Data stores"],["limits","Limits"]];
+  var nav=document.getElementById("tabs");
+  function show(id){
+    tabs.forEach(function(t){document.getElementById(t[0]).classList.toggle("on",t[0]===id)});
+    Array.prototype.forEach.call(nav.children,function(b){b.classList.toggle("on",b.dataset.id===id)});
+    try{history.replaceState(null,"","#"+id)}catch(e){}
+    window.scrollTo(0,0);
+  }
+  tabs.forEach(function(t){
+    var b=document.createElement("button");b.textContent=t[1];b.dataset.id=t[0];
+    b.onclick=function(){show(t[0])};nav.appendChild(b);
+  });
+  var h=(location.hash||"").slice(1);
+  show(tabs.some(function(t){return t[0]===h})?h:"overview");
+})();
+</script>
+</body>
+</html>

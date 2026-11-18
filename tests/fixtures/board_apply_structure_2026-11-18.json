@@ -1,0 +1,18 @@
+{
+  "captured": "2026-11-18, owner's Chrome, nothing submitted, no personal values",
+  "internshala": {
+    "apply_buttons": ["button#top_easy_apply_button", "button#mobile_easy_apply_button", "button#easy_apply_button"],
+    "modal": "div#easy_apply_modal.modal.show (bootstrap, in the document)",
+    "fields": ["radio name=confirm_availability (x4)", "text#last_working_date", "select#notice_period", "textarea#confirm_availability_textarea", "file#custom_resume"],
+    "submit": "button#submit type=submit",
+    "close": "button#easy_apply_modal_close then (if shown) button#easy_apply_modal_close_confirm_exit"
+  },
+  "wellfound": {
+    "loads_in_owner_chrome": true,
+    "apply_buttons": ["button 'Apply' (header)", "button 'Apply now' (body)"],
+    "nav_trap": "a[data-test=ItemApplied] text 'Applied' = the applications list, NOT this job's state",
+    "modal_buttons": ["Show More", "Cancel", "Send application"],
+    "modal_fields": ["textarea name=customQuestionAnswers[<id>][...] (screening answer)"],
+    "experience_warning": "modal text 'outside the years of experience preferred' appears for 8+ years roles"
+  }
+}

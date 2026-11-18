@@ -11,6 +11,7 @@
 // Config (prompts, searches, rules) is made from the laptop app's own settings by cloud/deploy.py.
 import CONFIG from "./config.json";
 import { handleApp } from "./dashboard.js";
+import { applyRoute, applyTelegram } from "./applybot.js";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 const LAPTOP_QUIET_MS = 15 * 60 * 1000;
@@ -146,6 +147,13 @@ function boardReject(job) {  // llm_filter._board_reject (stretch jobs off)
   if (m && parseFloat(m[1]) >= CONFIG.reject_from_years + (CONFIG.stretch_jobs ? 1 : 0)) {
     if (aiReadsYearsPosts(job)) return null;  // the AI reads the post: "3-5 yrs" may still welcome freshers
     return ["needs_experience", level];
+  }
+  // Nov 16: the post itself states PRE_AI_YEARS_MIN+ years and nothing welcomes freshers: decide() rejects it after the AI
+  // call anyway (llm_filter._board_reject has the same rule; back-test: 34% of AI-checked jobs skip the AI)
+  if (!/^\s*0(?:\.\d+)?\s*(?:-|–|to)\s*\d/.test(level)) {
+    const ey = explicitYears(job.description);
+    if (ey !== null && ey >= 3 && !FRESH_TEXT.test(String(job.description || "")) && !FRESH_TITLE.test(String(job.title || "")))
+      return ["needs_experience", `The post asks for ${ey}+ years`];
   }
   return null;
 }
@@ -869,6 +877,25 @@ function jobBlock(n, j) {
 // Groq key+model pairs that hit their daily limit (kept while this Worker instance lives): skipping them
 // saves subrequests (12 failing tries per call otherwise, of ~45 per run).
 const aiSkip = new Map();
+// Daily-limit / bad-key markers survive the Worker's isolate restarts (measured Nov 18: with an in-memory map only, every minute re-probed all
+// exhausted Groq keys: 1,100+ failed calls a day that ate the subrequest budget, so NVIDIA (the free fallback) was reached 1-8 times a day).
+let skipsLoadedAt = 0;
+async function loadSkips(env) {
+  if (now() - skipsLoadedAt < 120000) return;
+  skipsLoadedAt = now();
+  try {
+    const raw = await getState(env, "ai_skips", {});
+    for (const [k, until] of Object.entries(raw || {})) if (until > now() && (aiSkip.get(k) || 0) < until) aiSkip.set(k, until);
+  } catch { /* the markers are an optimisation only */ }
+}
+async function saveSkip(env, k, until) {
+  try {
+    const raw = (await getState(env, "ai_skips", {})) || {};
+    for (const [kk, u] of Object.entries(raw)) if (u <= now()) delete raw[kk];
+    raw[k] = until;
+    await setState(env, "ai_skips", raw);
+  } catch { /* ignore */ }
+}
 // NVIDIA (build.nvidia.com, free, per-key limits): fallback after Groq. Tested on the laptop's 45 filter
 // cases: nemotron-3-ultra 45/45 (thinking off), nemotron-3.5-lightning 45/45.
 const NVIDIA_MODELS = ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-lightning-30b-a3b"];
@@ -887,16 +914,28 @@ function parseItems(content, allowEmpty) {
   return null;
 }
 
+// Token use per call (day = IST date, per provider/model/key number/step): read it at GET /api/usage.
+async function logUsage(env, provider, model, keyNo, step, u, fail, n = 1) {
+  try {
+    const day = new Date(now() + 19800000).toISOString().slice(0, 10);
+    await env.DB.prepare("INSERT INTO ai_usage (day, provider, model, key_no, step, calls, fails, tok_in, tok_out, tok_total, tok_cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(day, provider, model, key_no, step) DO UPDATE SET calls = calls + ?, fails = fails + ?, tok_in = tok_in + ?, tok_out = tok_out + ?, tok_total = tok_total + ?, tok_cached = tok_cached + ?")
+      .bind(day, provider, model, keyNo, step, fail ? 0 : n, fail ? n : 0, u?.prompt_tokens || 0, u?.completion_tokens || 0, u?.total_tokens || 0, u?.prompt_tokens_details?.cached_tokens || 0,
+            fail ? 0 : n, fail ? n : 0, u?.prompt_tokens || 0, u?.completion_tokens || 0, u?.total_tokens || 0, u?.prompt_tokens_details?.cached_tokens || 0).run();
+  } catch { /* logging never breaks a call */ }
+}
+
 async function groq(env, b, system, user, schema, name, allowEmpty = false, effort = "low") {
+  await loadSkips(env);
   const keys = String(env.GROQ_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
   const start = Math.floor(now() / 60000) % Math.max(1, keys.length);
   const order = keys.slice(start).concat(keys.slice(0, start));
   for (const model of CONFIG.models) {
     for (const key of order) {
+      const keyNo = keys.indexOf(key) + 1;
       const skipKey = key.slice(-6) + model;
       if ((aiSkip.get(skipKey) || 0) > now()) continue;
       if (b.left < 3) throw new Error("no subrequests left");
-      const body = { model, temperature: 0, max_completion_tokens: 4000,
+      const body = { model, temperature: 0, max_completion_tokens: 2200,  // Groq counts this reserve against the 8k tokens/min of the key: 4000 allowed ~1 call/min/key
                      messages: [{ role: "system", content: system }, { role: "user", content: user }],
                      response_format: { type: "json_schema", json_schema: { name, strict: true, schema } } };
       if (model.startsWith("openai/gpt-oss")) body.reasoning_effort = effort;
@@ -904,11 +943,18 @@ async function groq(env, b, system, user, schema, name, allowEmpty = false, effo
       const r = await b.fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) {  // per-minute / daily limit or bad key: the next key, then the next model
-        if (r.status === 401 || r.status === 403) aiSkip.set(skipKey, now() + 30 * 60 * 1000);
-        else if (r.status === 429 && /\(TPD\)|\(RPD\)|per day/.test(await r.text())) aiSkip.set(skipKey, now() + 30 * 60 * 1000);
+        await logUsage(env, "groq", model, keyNo, name, null, true);
+        if (r.status === 401 || r.status === 403) { aiSkip.set(skipKey, now() + 30 * 60 * 1000); await saveSkip(env, skipKey, now() + 30 * 60 * 1000); }
+        else if (r.status === 429) {
+          const txt = await r.text();
+          if (/\(TPD\)|\(RPD\)|per day/.test(txt)) { aiSkip.set(skipKey, now() + 30 * 60 * 1000); await saveSkip(env, skipKey, now() + 30 * 60 * 1000); }
+          else aiSkip.set(skipKey, now() + Math.min(60, Math.max(5, Math.ceil(Number(r.headers.get("retry-after")) || 15))) * 1000);  // per-minute limit: rest this key+model briefly instead of retrying it on every call
+        }
         continue;
       }
-      const items = parseItems((await r.json()).choices?.[0]?.message?.content, allowEmpty);
+      const resp = await r.json();
+      await logUsage(env, "groq", model, keyNo, name, resp.usage, false);
+      const items = parseItems(resp.choices?.[0]?.message?.content, allowEmpty);
       if (items) return items;
     }
   }
@@ -917,6 +963,7 @@ async function groq(env, b, system, user, schema, name, allowEmpty = false, effo
   const norder = nkeys.slice(nstart).concat(nkeys.slice(0, nstart));
   for (const model of NVIDIA_MODELS) {
     for (const key of norder) {
+      const keyNo = nkeys.indexOf(key) + 1;
       const skipKey = key.slice(-6) + model;
       if ((aiSkip.get(skipKey) || 0) > now()) continue;
       if (b.left < 3) throw new Error("no subrequests left");
@@ -929,16 +976,61 @@ async function groq(env, b, system, user, schema, name, allowEmpty = false, effo
         r = await b.fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
           method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
           body: JSON.stringify(body), signal: AbortSignal.timeout(60000) });
-      } catch { aiSkip.set(skipKey, now() + 10 * 60 * 1000); continue; }  // overloaded: skip it a while
+      } catch { aiSkip.set(skipKey, now() + 10 * 60 * 1000); await logUsage(env, "nvidia", model, keyNo, name, null, true); continue; }  // overloaded: skip it a while
       if (!r.ok) {
+        await logUsage(env, "nvidia", model, keyNo, name, null, true);
         aiSkip.set(skipKey, now() + (r.status === 429 ? 30 * 1000 : 30 * 60 * 1000));
         continue;
       }
-      const items = parseItems((await r.json()).choices?.[0]?.message?.content, allowEmpty);
+      const resp = await r.json();
+      await logUsage(env, "nvidia", model, keyNo, name, resp.usage, false);
+      const items = parseItems(resp.choices?.[0]?.message?.content, allowEmpty);
       if (items) return items;
     }
   }
   throw new Error("every AI key is busy or used up");
+}
+
+// Same post on another board / a repost: reuse the earlier AI answer instead of paying again (measured: ~23% of
+// facts calls were title|company repeats). Same idea as the laptop's _same_post: only a near-identical description
+// counts (reposts 0.97-0.99, other openings 0.04-0.50); decide() still runs on the NEW job (its location/board rules).
+function postGrams(text) {
+  const t = String(text || "").toLowerCase().replace(/\s+/g, " ").trim().slice(0, 1500);
+  const w = t.split(" "), grams = new Set();
+  for (let i = 0; i + 2 < w.length; i++) grams.add(w[i] + " " + w[i + 1] + " " + w[i + 2]);
+  return { t, grams };
+}
+function samePost(a, b) {
+  const x = postGrams(a), y = postGrams(b);
+  if (x.t.length < 200 || y.t.length < 200) return x.t.length > 0 && x.t === y.t;  // too short to compare: only an exact copy
+  let hit = 0;
+  for (const g of x.grams) if (y.grams.has(g)) hit++;
+  return hit / (x.grams.size + y.grams.size - hit || 1) >= 0.85;
+}
+async function findReusable(env, rows) {
+  const reuse = new Map();
+  try {
+    const since = now() - 7 * DAY;
+    const res = await env.DB.batch(rows.map((j) => env.DB.prepare(
+      "SELECT description, facts, fit FROM jobs INDEXED BY jobs_tcf WHERE title = ? COLLATE NOCASE AND company = ? COLLATE NOCASE AND id != ? AND found_at > ? AND facts IS NOT NULL AND facts != '' AND status IN ('keep','reject') ORDER BY found_at DESC LIMIT 3")
+      .bind(j.title, j.company, j.id, since)));
+    rows.forEach((j, i) => {
+      for (const o of res[i].results || []) {
+        if (!samePost(j.description, o.description)) continue;
+        try { reuse.set(j.id, { f: JSON.parse(o.facts), fit: o.fit ? JSON.parse(o.fit) : null }); } catch { /* unreadable: ask the AI */ }
+        break;
+      }
+    });
+  } catch { /* no reuse: the AI checks as before */ }
+  return reuse;
+}
+
+// Jobs the owner sent to the bot: tell the owner what happened to them (rejected / duplicate), since no alert follows.
+const isForward = (j) => String(j.description || "").includes("(Sent to the bot");
+async function tellBot(env, b, j, text) {
+  if (!isForward(j) || !env.TELEGRAM_CHAT_ID || b.left < 3) return;
+  try { await tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, parse_mode: "HTML", disable_web_page_preview: true,
+    text: `📥 <b>${esc(j.title)}</b> (${esc(j.company)}): ${text}` }); } catch { /* best effort */ }
 }
 
 async function aiStep(env, b) {
@@ -951,21 +1043,34 @@ async function aiStep(env, b) {
     const drop = new Map(screen.filter((r) => r && r.drop && CONFIG.title_why[r.why] && rows[r.n - 1]).map((r) => [rows[r.n - 1].id, CONFIG.title_why[r.why]]));
     if (drop.size) {
       await env.DB.batch([...drop].map(([id, cat]) => env.DB.prepare("UPDATE jobs SET status = 'reject', category = ?, reason = 'Ruled out from the title' WHERE id = ?").bind(cat, id)));
+      for (const j of rows) if (drop.has(j.id)) await tellBot(env, b, j, "🚫 rejected by the AI from the title alone.");
       rows = rows.filter((j) => !drop.has(j.id));
       if (!rows.length) return [];
     }
   } catch { /* without the screen, the full check still runs */ }
-  let facts;
-  try {
-    facts = await groq(env, b, CONFIG.facts_prompt, "One result per job; n = job number.\n\n" + rows.map((j, i) => jobBlock(i + 1, j)).join("\n\n"),
-                       CONFIG.facts_schema, "job_facts");
-  } catch (e) {
-    await env.DB.batch(rows.map((j) => env.DB.prepare("UPDATE jobs SET tries = tries + 1 WHERE id = ?").bind(j.id)));
-    return [];
+  // earlier answer for the same post? (a reused "keep" also needs its earlier fit answer, else the AI checks it)
+  const reuse = await findReusable(env, rows);
+  for (const [id, r] of [...reuse]) {
+    const [dec] = decide(r.f, rows.find((x) => x.id === id));
+    if (dec === "keep" && !r.fit) reuse.delete(id);
+  }
+  if (reuse.size) await logUsage(env, "local", "reused-answer", 0, "reuse", null, false, reuse.size);
+  const todo = rows.filter((j) => !reuse.has(j.id));
+  let facts = [];
+  if (todo.length) {
+    try {
+      facts = await groq(env, b, CONFIG.facts_prompt, "One result per job; n = job number.\n\n" + todo.map((j, i) => jobBlock(i + 1, j)).join("\n\n"),
+                         CONFIG.facts_schema, "job_facts");
+    } catch (e) {
+      await env.DB.batch(todo.map((j) => env.DB.prepare("UPDATE jobs SET tries = tries + 1 WHERE id = ?").bind(j.id)));
+      if (!reuse.size) return [];
+    }
   }
   const byN = Object.fromEntries(facts.filter((r) => r && r.n).map((r) => [r.n, r]));
-  const verdicts = rows.map((j, i) => {
-    const r = byN[i + 1];
+  const verdicts = rows.map((j) => {
+    const re = reuse.get(j.id);
+    if (re) { const [decision, category] = decide(re.f, j); return { f: re.f, decision, category, reused: true }; }
+    const r = byN[todo.indexOf(j) + 1];
     if (!r || !ROLE[r.role] || !EMP[r.emp]) return null;
     const f = { employment_type: EMP[r.emp], min_years_required: r.yrs, freshers_welcome: !!r.fresh, needs_postgrad: !!r.pg, seniority: SEN[r.sen] || "unclear",
                 role_type: ROLE[r.role], experience_evidence: r.ev || "", reason: r.why || "" };
@@ -974,17 +1079,19 @@ async function aiStep(env, b) {
   });
   const passing = rows.map((j, i) => [j, verdicts[i]]).filter(([, v]) => v && v.decision === "keep");
   const fits = {};
+  for (const [j, v] of passing) if (v.reused) fits[j.id] = { ...reuse.get(j.id).fit, reused: true };
+  const passAI = passing.filter(([, v]) => !v.reused);
   if (passing.length) {
-    try {
-      const res = await groq(env, b, CONFIG.fit_prompt, "One result per job; n = job number.\n\n" + passing.map(([j], i) => jobBlock(i + 1, j)).join("\n\n"),
+    if (passAI.length) try {
+      const res = await groq(env, b, CONFIG.fit_prompt, "One result per job; n = job number.\n\n" + passAI.map(([j], i) => jobBlock(i + 1, j)).join("\n\n"),
                              CONFIG.fit_schema, "skill_fit");
-      for (const r of res) if (r && r.n && passing[r.n - 1]) fits[passing[r.n - 1][0].id] = r;
+      for (const r of res) if (r && r.n && passAI[r.n - 1]) fits[passAI[r.n - 1][0].id] = r;
     } catch { /* fit check failed: those jobs stay "new" and are tried again */ }
     // Second look for fit rejections (the audit found most wrong rejections here): the full post, deeper reasoning.
     let looks = 0;
     for (const [j] of passing) {
       const ft = fits[j.id];
-      if (!ft || ft.code !== false || looks >= 2 || b.left < 8) continue;
+      if (!ft || ft.reused || ft.code !== false || looks >= 2 || b.left < 8) continue;
       looks++;
       try {
         const res = await groq(env, b, CONFIG.fit_prompt + "\n\n" + CONFIG.second_look,
@@ -1012,6 +1119,12 @@ async function aiStep(env, b) {
       .bind(status, category, reason, fit, JSON.stringify(v.f), j.id));
   });
   if (stmts.length) await env.DB.batch(stmts);
+  for (const [i, j] of rows.entries()) {
+    if (!isForward(j) || !verdicts[i]) continue;
+    const ft = fits[j.id];
+    if (verdicts[i].decision !== "keep") await tellBot(env, b, j, `🚫 rejected by the AI: ${esc(String(verdicts[i].f.reason || verdicts[i].category || "not a match").slice(0, 150))}`);
+    else if (ft && ft.code === false) await tellBot(env, b, j, `🚫 rejected by the AI: ${esc(String(ft.why || "not a match").slice(0, 150))}`);
+  }
   return kept;
 }
 
@@ -1049,6 +1162,44 @@ function alertTooOld(j) {
   return j.posted_days != null && +j.posted_days >= 2;
 }
 
+// Target companies (CONFIG.li_companies: IBM, NTT DATA, Cognizant... simple apply -> assessment -> interview hiring): their alerts get a
+// priority banner. Names are compared without generic words (Technologies, Services, India, Limited...), whole words from the start.
+const GENERIC = new RegExp("\\b(technologies|technology|services|service|limited|ltd|pvt|private|india|inc|systems|software|solutions|global|group|corporation|corp|llc)\\b", "g");
+const coKey = (n) => String(n || "").toLowerCase().replace(/&/g, "").replace(GENERIC, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+const TARGETS = (CONFIG.li_companies || []).map((c) => coKey(c[0])).filter((k) => k.length >= 2);
+function targetCompany(company) {
+  const k = coKey(company);
+  if (!k) return "";
+  const hit = TARGETS.find((t) => k === t || k.startsWith(t + " "));
+  return hit ? hit.toUpperCase() : "";
+}
+
+async function ensureApplied(env) {  // every job marked applied (any way), one row per job: /dashboard counts these
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS applied (uid TEXT PRIMARY KEY, at INTEGER NOT NULL, title TEXT, company TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS applied_at ON applied(at)").run();
+  if (!(await getState(env, "applied_backfill", null))) {  // earlier Telegram ✅ taps
+    await env.DB.prepare("INSERT OR IGNORE INTO applied (uid, at, title, company) SELECT x.uid, MIN(x.at), j.title, j.company FROM actions x LEFT JOIN jobs j ON j.id = x.uid WHERE x.action = 'a' GROUP BY x.uid").run();
+    await setState(env, "applied_backfill", true);
+  }
+}
+
+const REPO_URL = "https://github.com/Rugvedrc/fresherpilot";
+const STRANGER_TEXT =
+  "👋 <b>Hello, and thanks for reaching out.</b>\n\n" +
+  "This is <b>FresherPilot</b>, a personal job-search assistant. It reads job boards around the clock, checks each posting with AI, and sends only the relevant fresher roles to its owner.\n\n" +
+  "🔒 <b>This bot is not linked to your account yet</b>, so commands such as /status, /jobs and /dashboard have nothing to show you. Each person runs their own copy, so your jobs and settings stay private.\n\n" +
+  "<b>To set up your own FresherPilot</b>\n" +
+  `1. Clone the project: <code>git clone ${REPO_URL}.git</code>\n` +
+  "2. Follow the setup guide (README) and fill in your profile, preferred cities and API keys.\n" +
+  "3. Create your own Telegram bot with @BotFather and link it to your chat.\n" +
+  "4. Run <code>python main.py</code> and open http://localhost:8000.\n\n" +
+  "📚 <b>Links</b>\n" +
+  `• Project: ${REPO_URL}\n` +
+  `• Setup guide: ${REPO_URL}#readme\n` +
+  `• Deployment guide: ${REPO_URL}/blob/main/docs/DEPLOY.md\n` +
+  `• Architecture: ${REPO_URL}/blob/main/docs/ARCHITECTURE.md\n\n` +
+  "Questions? Contact the person who shared this bot with you. Good luck with your job search! 🚀";
+
 function jobText(j) {  // same look as the laptop app's alerts
   const f = j.facts || {}, ft = j.fitv || {};
   const years = f.min_years_required;
@@ -1065,11 +1216,17 @@ function jobText(j) {  // same look as the laptop app's alerts
     const m = (Date.now() - j.found_at) / 60000 + j.within_min;
     if (m < 36 * 60) posted = "< " + ago(m).replace(" ago", "") + " ago";
   }
-  const lines = [`🆕 <b>${esc(j.title)}</b>`, `🏢 ${esc(j.company)}` + (j.location ? `  ·  📍 ${esc(j.location)}` : ""),
-                 [exp && `🎓 ${esc(exp)}`, posted && `🕒 ${posted}`, `via ${esc(j.source)} ☁️`].filter(Boolean).join(" · ")];
-  if (MODE_LABEL[applyMode(j)]) lines.push(MODE_LABEL[applyMode(j)]);
-  if (typeof years === "number" && years >= 1 && f.freshers_welcome) lines.push(`🎯 Lists ${years}+ yrs, but the post says skilled freshers are welcome: worth a try`);
-  if (ft.why || f.reason) lines.push(`✅ ${esc(ft.why || f.reason).slice(0, 300)}`);
+  const tc = targetCompany(j.company);
+  // Layout: header (priority banner or "New job"), the role, then one fact per line, then why it fits.
+  const lines = [tc ? `⭐ <b>PRIORITY · ${esc(tc)}</b>\n<i>Simple test + interview hiring: apply fast</i>` : `🆕 <b>New job</b>`, "",
+                 `💼 <b>${esc(j.title)}</b>`, `🏢 ${esc(j.company)}`];
+  if (j.location) lines.push(`📍 ${esc(j.location)}`);
+  if (exp) lines.push(`🎓 ${esc(exp)}`);
+  if (posted) lines.push(`🕒 Posted ${posted}`);
+  const mode = MODE_LABEL[applyMode(j)];
+  lines.push(`🔗 ${esc(j.source)}${mode ? ` · ${mode}` : ""}`);
+  if (typeof years === "number" && years >= 1 && f.freshers_welcome) lines.push("", `🎯 Lists ${years}+ yrs, but freshers are welcome: worth a try`);
+  if (ft.why || f.reason) lines.push("", `💡 ${esc(ft.why || f.reason).slice(0, 260)}`);
   return lines.join("\n");
 }
 
@@ -1109,7 +1266,7 @@ async function claim(env, keys) {
   return true;
 }
 
-async function sendAlert(env, b, { uid, text, url, blog_url, source, keys }) {
+async function sendAlert(env, b, { uid, text, url, blog_url, source, keys, company, title, apply_mode }) {
   const prior = await env.DB.prepare("SELECT uid FROM alerts WHERE uid = ?").bind(uid).first();
   if (prior) return false;
   if (!(await claim(env, keys || []))) {  // the same job (repost / other board) was already alerted or seen
@@ -1125,14 +1282,141 @@ async function sendAlert(env, b, { uid, text, url, blog_url, source, keys }) {
   return !!r.ok;
 }
 
+// Anything the owner sends the bot (a forwarded post of ANY channel, a digest, a pasted job, a link alone, or plain typing) is read
+// by the AI into separate jobs, then enters the normal pipeline (rules -> AI check -> alert) like every other source.
+const MSG_SCHEMA = { type: "object", additionalProperties: false, required: ["r"], properties: { r: { type: "array", items: {
+  type: "object", additionalProperties: false, required: ["title", "company", "location", "experience", "apply_url", "details"],
+  properties: { title: { type: "string" }, company: { type: "string" }, location: { type: "string" }, experience: { type: "string" },
+                apply_url: { type: "string" }, details: { type: "string" } } } } } };
+const MSG_PROMPT = `You read ONE message that a job seeker forwarded or typed. It can be in any format: a single job post, a digest of many jobs, a casual note ("X is hiring freshers, link ..."), a pasted job description, a bare link with a little text, or no job at all.
+Return r = one item per DISTINCT job opening in the message (max 15). Return an empty list when the message holds no job opening (greetings, ads, courses, channel promotions, questions).
+For each job: title = the role as written (if only a company and general hiring is stated, use the best short description such as "Software Engineer (freshers)"); company; location (as written, "" if none); experience (as written, e.g. "0-1 years", "Freshers", else "Not specified"); apply_url = copy EXACTLY one URL from the Links list that belongs to this job, "" if none fits (never invent a URL); details = the job's requirements, skills, eligibility and responsibilities copied or condensed from the message (<= 500 characters, no marketing text).
+Do not merge different roles or different companies into one item. Do not make up facts that are not in the message.`;
+
+const fnv = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h.toString(36); };
+
+async function pageText(b, url) {
+  try {
+    const r = await b.fetch(url, { headers: { "User-Agent": UA } });
+    if (!r.ok) return "";
+    const html = await r.text();
+    return decode(html.replace(/<(script|style|nav|footer|header|aside|svg)[\s\S]*?<\/\1>/gi, " ").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 5000);
+  } catch { return ""; }
+}
+
+// Rule-based reading, used only when no AI key answers: numbered digests are split, each block parsed by the channel parser.
+function readByRules(raw, links) {
+  const starts = [...raw.matchAll(/^[ \t]*\d{1,3}[.)][ \t]+\S/gm)].map((x) => x.index);
+  const ranges = starts.length >= 2 ? starts.map((a, i) => [a, i + 1 < starts.length ? starts[i + 1] : raw.length]) : [[0, raw.length]];
+  const out = [];
+  for (const [a, z] of ranges.slice(0, 25)) {
+    const part = raw.slice(a, z);
+    const ls = links.filter((l) => l.at >= a && l.at < z).map((l) => l.url);
+    const f = parsePost(part.normalize("NFKC").trim().replace(/^\d{1,3}[.)]\s+/, ""), [...new Set(ls)]);
+    if (f) out.push({ title: f.title, company: f.company, location: f.location, experience: f.experience, apply_url: f.url, details: part.slice(0, 500) });
+  }
+  return out;
+}
+
+async function ingestForward(env, b, m, say) {
+  const raw = String(m.text || m.caption || "").trim();
+  if (!raw) return say("⚠️ I can only read text. Send the job as text, or a photo with the details in the caption.");
+  const ents = (m.entities || m.caption_entities || []).filter((e) => e.type === "text_link" || e.type === "url");
+  const links = ents.map((e) => ({ url: e.type === "text_link" ? e.url : raw.slice(e.offset, e.offset + e.length), at: e.offset,
+                                   label: e.type === "text_link" ? raw.slice(e.offset, e.offset + e.length).slice(0, 40) : "" }));
+  for (const x of raw.matchAll(/https?:\/\/[^\s<>"]+/g)) if (!links.some((l) => Math.abs(l.at - x.index) < 3)) links.push({ url: x[0], at: x.index, label: "" });
+  for (const l of links) l.url = l.url.replace(/[)\].,;!]+$/, "");
+  const o = m.forward_origin || {};
+  const when = new Date((o.date || m.forward_date || m.date) * 1000).toISOString();
+  const chat = o.chat || m.forward_from_chat || {};
+  const msgId = o.message_id || m.forward_from_message_id;
+  const origin = chat.username && msgId ? `https://t.me/${chat.username}/${msgId}` : "";
+
+  // a bare link (little other text): read the page behind it
+  const stripped = raw.replace(/https?:\/\/\S+/g, "").replace(/\s+/g, " ").trim();
+  let sources = [{ text: raw, links, base: 0 }];
+  if (links.length && stripped.length < 40) {
+    sources = [];
+    for (const l of links.slice(0, 2)) { const t = await pageText(b, l.url); if (t) sources.push({ text: `${stripped}\n(Page at ${l.url})\n${t}`, links: [{ ...l, at: 0 }], base: 0 }); }
+    if (!sources.length) sources = [{ text: raw, links, base: 0 }];
+  }
+
+  // AI extraction, in chunks of ~4500 characters (a digest can be long)
+  let items = [], aiOk = true, cut = false;
+  try {
+    for (const src of sources) {
+      const paras = [...src.text.matchAll(/[^\n]+(?:\n(?!\s*\n)[^\n]*)*/g)];
+      const chunks = []; let cur = null;
+      for (const p of paras) {
+        if (cur && p.index + p[0].length - cur.a <= 4500) cur.z = p.index + p[0].length;
+        else { cur = { a: p.index, z: p.index + p[0].length }; chunks.push(cur); }
+      }
+      if (chunks.length > 6) cut = true;
+      for (const c of chunks.slice(0, 6)) {
+        const text = src.text.slice(c.a, c.z);
+        const ls = src.links.filter((l) => l.at >= c.a && l.at < c.z).slice(0, 25);
+        const user = `Message:\n${text}\n\nLinks:\n${ls.length ? ls.map((l, i) => `${i + 1}. ${l.url}${l.label ? ` (shown as "${l.label}")` : ""}`).join("\n") : "(none)"}`;
+        const res = await groq(env, b, MSG_PROMPT, user, MSG_SCHEMA, "forward_extract", true, "low");
+        for (const x of res) items.push({ ...x, _links: ls.map((l) => l.url), _text: text });
+      }
+    }
+  } catch { aiOk = false; }
+  if (!aiOk) items = readByRules(raw, links).map((x) => ({ ...x, _links: links.map((l) => l.url), _text: raw }));
+  if (!items.length) return say(aiOk ? "ℹ️ I didn't find a job opening in that message." : "⚠️ The AI is busy and the message didn't match a known format. Try again in a minute.");
+
+  const jobs = [];
+  if (items.length > 30) cut = true;
+  for (const x of items.slice(0, 30)) {
+    const title = String(x.title || "").trim().slice(0, 120);
+    if (!title) continue;
+    let url = String(x.apply_url || "").trim();
+    if (url && !x._links.includes(url)) url = "";                     // the AI may only choose a link that was in the message
+    if (!url && items.length === 1 && x._links.length === 1) url = x._links[0];
+    url = url ? await unshorten(b, url) : "";
+    let blogUrl = "", extra = "";
+    if (url && isBlog(url)) {
+      const blog = await resolveBlog(b, url);
+      if (blog) { const official = await unshorten(b, blog.url || url); blogUrl = url; url = official; extra = blog.description || ""; }
+    }
+    const company = String(x.company || "").trim().slice(0, 80) || "Unknown";
+    const single = items.length === 1 && raw.length <= 6000;
+    const head = `Role: ${title}\nCompany: ${company}\nLocation: ${x.location || ""}\nExperience: ${x.experience || "Not specified"}`;
+    jobs.push({ id: fnv(`${company}|${title}|${url}`.toLowerCase()).replace(/^/, "tgfwd:"), source: "Telegram", title, company, location: String(x.location || "").slice(0, 120),
+      experience: String(x.experience || "Not specified").slice(0, 80), url, blog_url: blogUrl, posted: when, posted_days: daysAgo(when),
+      description: `${head}\n\n${single ? raw.normalize("NFKC") : x.details}${extra ? `\n\nJob details:\n${extra}` : ""}\n\n(Sent to the bot${origin ? `, original post: ${origin}` : ""})` });
+  }
+  if (!jobs.length) return say("ℹ️ I didn't find a job opening in that message.");
+  const ids = jobs.map(uidOf);
+  const mark = ids.map(() => "?").join(",");
+  const before = new Set((await env.DB.prepare(`SELECT id FROM seen WHERE id IN (${mark})`).bind(...ids).all()).results.map((r) => r.id));
+  await addJobs(env, jobs);
+  const st = new Map((await env.DB.prepare(`SELECT id, status, reason FROM jobs WHERE id IN (${mark})`).bind(...ids).all()).results.map((r) => [r.id, r]));
+  let queued = 0, ruled = 0, known = 0;
+  const lines = jobs.map((j) => {
+    const r = st.get(uidOf(j)), nm = `${esc(j.title)} (${esc(j.company)})`;
+    if (before.has(uidOf(j))) { known++; return `• ${nm}: already known${r ? " - " + esc(r.status) : ""}`; }
+    if (r && r.status === "reject") { ruled++; return `• ${nm}: dropped by rules - ${esc(String(r.reason || "").replace(/^Rule: /, "").slice(0, 60))}`; }
+    queued++; return `• ${nm}: to the AI check${j.url ? "" : " (no apply link found)"}`;
+  });
+  return say(`📥 <b>${jobs.length} job(s) read</b>: ${queued} to the AI check, ${ruled} dropped by rules, ${known} already known\n${lines.join("\n").slice(0, 3200)}\nJobs that pass arrive as alerts.${cut ? "\n⚠️ The message was very long: only the first part was read. Send the rest as another message." : ""}${aiOk ? "" : "\n(AI was busy: read by the basic parser.)"}`);
+}
+
 async function onTelegram(env, update) {
   const b = new Budget(40);
   const q = update.callback_query;
   if (q) {
-    if (String(q.message?.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) return;
+    if (String(q.message?.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) {
+      await tg(env, b, "answerCallbackQuery", { callback_query_id: q.id, text: "This bot isn't linked to your account yet. Send /start for setup steps.", show_alert: true });
+      return;
+    }
     const [action, uid] = String(q.data || "").split(/\|(.*)/s);
     const label = { a: "Marked as applied ✅", v: "Marked as seen 👀", x: "Hidden from new jobs 🚫" }[action];
     if (!label || !uid) { await tg(env, b, "answerCallbackQuery", { callback_query_id: q.id }); return; }
+    if (action === "a") {
+      await ensureApplied(env);
+      const jr = await env.DB.prepare("SELECT title, company FROM jobs WHERE id = ?").bind(uid).first();
+      await env.DB.prepare("INSERT OR IGNORE INTO applied (uid, at, title, company) VALUES (?, ?, ?, ?)").bind(uid, now(), jr?.title || "", jr?.company || "").run();
+    }
     await env.DB.batch([
       env.DB.prepare("INSERT INTO actions (uid, action, at) VALUES (?, ?, ?)").bind(uid, action, now()),
       env.DB.prepare("UPDATE alerts SET state = ? WHERE uid = ?").bind({ a: "applied", v: "seen", x: "hidden" }[action], uid),
@@ -1144,9 +1428,19 @@ async function onTelegram(env, update) {
     return;
   }
   const m = update.message;
-  if (!m || String(m.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) return;
+  if (!m) return;
+  if (String(m.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) {  // someone else: never touch the owner's data, just explain (once per hour per chat)
+    if (m.chat?.type !== "private") return;
+    const k = "stranger_" + m.chat.id, last = await getState(env, k, 0);
+    if (now() - last < 3600e3) return;
+    await setState(env, k, now());
+    await tg(env, b, "sendMessage", { chat_id: m.chat.id, parse_mode: "HTML", disable_web_page_preview: true, text: STRANGER_TEXT });
+    return;
+  }
   const text = String(m.text || "").trim();
   const say = (t) => tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text: t, parse_mode: "HTML" });
+  if (await applyTelegram(env, b, m, say, APPLY_H, READER_REPO)) return;  // verification code / link for a waiting portal, /apply, /applystatus
+  if (!text.startsWith("/")) return ingestForward(env, b, m, say);  // any non-command message = jobs to read
   if (text.startsWith("/jobs") || text.startsWith("/easy") || text.startsWith("/site")) {
     // /easy = Easy Apply jobs (do them on the phone), /site = company-site jobs (do them on the laptop)
     const want = text.startsWith("/easy") ? "easy" : text.startsWith("/site") ? "site" : null;
@@ -1162,6 +1456,31 @@ async function onTelegram(env, update) {
       if (res.ok) sent++; else why = String(res.description || "").slice(0, 120);
     }
     if (sent < rows.length) await say(`⚠️ ${rows.length - sent} of ${rows.length} jobs could not be shown: ${esc(why)}`);
+  } else if (text.startsWith("/dashboard") || text.startsWith("/today")) {  // what you did today (IST day)
+    const IST = 5.5 * 3600e3, t0 = Math.floor((now() + IST) / DAY) * DAY - IST;
+    const one = async (sql, ...a) => (await env.DB.prepare(sql).bind(...a).first())?.n || 0;
+    await ensureApplied(env);
+    // applied = every job marked applied anywhere (Telegram button, auto-apply, the app's list), with its real time; priority = target company
+    const rows = (await env.DB.prepare("SELECT uid, at, title, company FROM applied WHERE at >= ? ORDER BY at DESC").bind(t0 - 6 * DAY).all()).results;
+    const isPri = (r) => !!targetCompany(r.company);
+    const today = rows.filter((r) => r.at >= t0), pri = (l) => l.filter(isPri).length;
+    const [sent, sentPri, seen, open] = await Promise.all([
+      one("SELECT COUNT(*) n FROM alerts WHERE at >= ? AND COALESCE(state,'') != 'dup'", t0),
+      one("SELECT COUNT(*) n FROM alerts WHERE at >= ? AND COALESCE(state,'') != 'dup' AND text LIKE '%PRIORITY%'", t0),
+      one("SELECT COUNT(DISTINCT uid) n FROM actions WHERE action = 'v' AND at >= ?", t0),
+      one("SELECT COUNT(*) n FROM alerts WHERE state IS NULL AND at >= ?", now() - DAY),
+    ]);
+    const applied = today.length, appliedPri = pri(today), wk = rows.length, wkPri = pri(rows);
+    const list = [...today.filter(isPri), ...today.filter((r) => !isPri(r))].slice(0, 12).map((r) => ({ ...r, pri: isPri(r) }));
+    const bar = (n, of) => { const k = of ? Math.round((10 * n) / of) : 0; return "▰".repeat(k) + "▱".repeat(10 - k); };
+    const date = new Date(now() + IST).toISOString().slice(0, 10);
+    await say(`📊 <b>Dashboard · ${date}</b>\n\n` +
+      `✅ <b>Applied today: ${applied}</b>\n` +
+      `⭐ <b>Priority applied: ${appliedPri}</b> of ${sentPri} priority alerts sent\n` +
+      `${bar(applied, sent)} ${applied} applied · ${sent} alerts today\n\n` +
+      `🔔 Alerts sent today: ${sent}\n👀 Marked seen: ${seen}\n📥 Still unmarked (24 h): ${open}\n\n` +
+      `📅 <b>Last 7 days</b>: ${wk} applied · ${wkPri} priority` +
+      (list.length ? `\n\n<b>Applied today</b>\n${list.map((r) => `${r.pri ? "⭐" : "•"} ${esc(r.title || "Job")}${r.company ? ` · ${esc(r.company)}` : ""}`).join("\n")}` : "\n\nNothing applied yet today. Send /jobs to see what is waiting."));
   } else if (text.startsWith("/stop")) { await setState(env, "alerts_off", true); await say("🔕 Alerts paused. Send /resume to turn them back on."); }
   else if (text.startsWith("/resume") || text.startsWith("/start")) { await setState(env, "alerts_off", false); await say("🔔 Alerts are on."); }
   else if (text.startsWith("/status")) {  // where every job is right now (same as the dashboard's Pipeline tab)
@@ -1209,6 +1528,7 @@ const HELP_TEXT = "🤖 <b>FresherPilot commands</b>\n\n" +
   "/jobs - newest jobs you haven't marked yet\n" +
   "/easy - 📱 Easy Apply ones (apply on the phone)\n" +
   "/site - 💻 company-site ones (apply on the laptop)\n" +
+  "/dashboard - how many jobs you applied today (and priority ones)\n" +
   "/status - pipeline now: each source's last read, jobs per stage, alerts\n" +
   "/laptopoff - hand everything to the cloud right now (it reads 24/7 anyway)\n" +
   "/stop - pause alerts\n" +
@@ -1238,7 +1558,7 @@ async function pipelineStatus(env) {
   // name, read by, expected minutes between reads, last good read (ms)
   const rows = [
     ["LinkedIn", "GitHub reader (2 machines)", 5, ghTimes(["linkedin_li0", "linkedin_li1", "linkedin"])],
-    ["Indeed", "GitHub reader", 8, ghTimes(["indeed"])],
+    ["Indeed", "GitHub reader", 8, ghTimes(["indeed", "indeed_ic0", "indeed_ic1"])],
     ["Telegram", "cloud, checked every minute", 2, tg.checked || 0],
     ["Naukri", "cloud via Apify", 8, naukriStart || 0],
     ["Internshala", "cloud", 8, (ok.srcInternshala || {}).at || 0],
@@ -1308,24 +1628,25 @@ async function aiAndAlerts(env, b, tight) {
     let sent = 0;
     for (const j of kept) {
       if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
-      if (j.posted_days != null && j.posted_days > CONFIG.posted_within_days) continue;
-      if (alertTooOld(j)) {  // stored and rated, but not worth a Telegram alert any more
+      if (!isForward(j) && j.posted_days != null && j.posted_days > CONFIG.posted_within_days) continue;
+      if (!isForward(j) && alertTooOld(j)) {  // stored and rated, but not worth a Telegram alert any more
         await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
         continue;
       }
-      if (await sendAlert(env, b, { uid: j.id, text: jobText(j), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
+      if (await sendAlert(env, b, { uid: j.id, text: jobText(j), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j), company: j.company, title: j.title, apply_mode: applyMode(j) })) sent++;
+      else await tellBot(env, b, j, "✅ passed the AI check, but you were already shown this job (duplicate), so no new alert.");
     }
     if (sent < MAX_ALERTS_PER_RUN && b.left > 6 && Math.floor(now() / 60000) % (tight ? 30 : 5) === 0) {
       const missed = (await env.DB.prepare(`SELECT j.* FROM jobs j LEFT JOIN alerts a ON a.uid = j.id
         WHERE j.status = 'keep' AND a.uid IS NULL AND j.found_at > ? ORDER BY j.found_at DESC LIMIT 6`).bind(now() - DAY).all()).results;
       for (const j of missed) {
         if (sent >= MAX_ALERTS_PER_RUN || b.left < 3) break;
-        if ((j.posted_days != null && j.posted_days > CONFIG.posted_within_days) || alertTooOld(j)) {
+        if (!isForward(j) && ((j.posted_days != null && j.posted_days > CONFIG.posted_within_days) || alertTooOld(j))) {
           await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, source, state, at) VALUES (?, '', ?, 'old', ?)").bind(j.id, j.source, now()).run();
           continue;
         }
         const job = { ...j, facts: JSON.parse(j.facts || "{}"), fitv: JSON.parse(j.fit || "{}") };
-        if (await sendAlert(env, b, { uid: j.id, text: jobText(job), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j) })) sent++;
+        if (await sendAlert(env, b, { uid: j.id, text: jobText(job), url: j.url, blog_url: j.blog_url, source: j.source, keys: await looseKeys(j), company: j.company, title: j.title, apply_mode: applyMode(j) })) sent++;
       }
     }
   return { kept, sent };
@@ -1393,6 +1714,7 @@ async function tick(env, only = null) {
 // ---------------------------------------------------------------- HTTP
 
 const json = (d, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { "Content-Type": "application/json" } });
+const APPLY_H = { json, now, getState, setState, tg, groq, Budget, esc };
 
 // The reader's "known since" query needs this index (without it every call scans all of `seen`). Created by the
 // Worker itself so it lands as soon as D1 accepts reads again; a no-op once it exists.
@@ -1441,6 +1763,7 @@ async function route(req, env, ctx) {
       return json({ ok: true });
     }
     if (req.headers.get("X-FP-Secret") !== env.CLOUD_SECRET) return json({ detail: "forbidden" }, 403);
+    if (url.pathname.startsWith("/api/apply")) { const ar = await applyRoute(req, env, url, APPLY_H); if (ar) return ar; }
     if (url.pathname === "/api/heartbeat") {
       const hb = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       if (!hb.passive) await setState(env, "laptop_seen", now());  // passive = a manual-mode laptop: don't pause the cloud
@@ -1462,7 +1785,10 @@ async function route(req, env, ctx) {
       // Telegram -> app is /api/actions). "applied" wins over "seen"; "hidden" taps are never overwritten.
       const marks = ((await req.json()).marks || []).filter((m) => Array.isArray(m) && typeof m[0] === "string").slice(0, 400);
       const st = [];
-      for (const [uid, what] of marks) {
+      await ensureApplied(env);
+      for (const [uid, what, at, title, company] of marks) {
+        // every applied job (also ones never alerted: auto-apply, laptop list) goes into the /dashboard's own table, with its real time
+        if (what === "applied") st.push(env.DB.prepare("INSERT OR IGNORE INTO applied (uid, at, title, company) VALUES (?, ?, ?, ?)").bind(uid, +at > 0 ? +at : now(), title || "", company || ""));
         if (what === "applied") st.push(env.DB.prepare("UPDATE alerts SET state = 'applied' WHERE uid = ? AND (state IS NULL OR state = 'seen')").bind(uid));
         else if (what === "seen") st.push(env.DB.prepare("UPDATE alerts SET state = 'seen' WHERE uid = ? AND state IS NULL").bind(uid));
       }
@@ -1481,6 +1807,12 @@ async function route(req, env, ctx) {
       const until = pend && pend.m ? pend.m : now() + 1;
       const rows = (await env.DB.prepare("SELECT id, source, title, company, location, experience, url, blog_url, posted, posted_days, description, work_type, status, category, reason, fit, facts, found_at, apply_mode, within_min FROM jobs WHERE found_at > ? AND found_at < ? ORDER BY found_at LIMIT 300").bind(since, until).all()).results;
       return json({ jobs: rows });
+    }
+    if (url.pathname === "/api/usage") {  // AI tokens per day / model / key / step (?days=3)
+      const days = Math.min(30, +(url.searchParams.get("days") || 3));
+      const from = new Date(now() + 19800000 - (days - 1) * DAY).toISOString().slice(0, 10);
+      const rows = (await env.DB.prepare("SELECT day, provider, model, key_no, step, calls, fails, tok_in, tok_out, tok_total, tok_cached FROM ai_usage WHERE day >= ? ORDER BY day, provider, model, key_no, step").bind(from).all()).results;
+      return json({ day_is: "IST", groq_limit_per_key_model_per_day: 200000, rows });
     }
     if (url.pathname === "/api/status") {
       const c = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(status='keep') AS k, SUM(status='new') AS p, SUM(status='reject') AS r FROM jobs WHERE found_at > ?").bind(now() - DAY).first();

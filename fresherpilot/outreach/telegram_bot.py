@@ -133,8 +133,10 @@ _MODE_BY_SOURCE = {"Internshala": "easy", "Wellfound": "easy", "Careers": "site"
 
 def apply_mode(job: dict[str, Any]) -> str:
     """"easy" = apply inside the board's own app (fine on the phone), "site" = the company's site (laptop), "" = unknown."""
-    mode = job.get("apply_mode") or _MODE_BY_SOURCE.get(str(job.get("source")), "")
-    return mode if mode in ("easy", "site") else ""
+    from fresherpilot.apply import route
+
+    cls = route.classify(job)["cls"]  # board field -> link host (company/ATS = site) -> board default
+    return cls if cls in ("easy", "site") else ""
 
 
 def _ago(seconds: float) -> str:
@@ -187,21 +189,24 @@ def _job_text(job: dict[str, Any], v: dict[str, Any]) -> str:
            f"{years:g}+ yr" if isinstance(years, (int, float)) and years else
            "0 yrs" if years == 0 else (job.get("experience") or ""))
     posted = age_label(job)
-    lines = [f"🆕 <b>{_e(job.get('title'))}</b>",
-             f"🏢 {_e(company)}" + (f"  ·  📍 {_e(job.get('location'))}" if job.get("location") else ""),
-             " · ".join(x for x in [f"🎓 {_e(exp)}" if exp else "", f"🕒 {posted}" if posted else "",
-                                     f"via {_e(job.get('source'))}"] if x)]
+    lines = ["🆕 <b>New job</b>", "", f"💼 <b>{_e(job.get('title'))}</b>", f"🏢 {_e(company)}"]
+    if job.get("location"):
+        lines.append(f"📍 {_e(job.get('location'))}")
+    if exp:
+        lines.append(f"🎓 {_e(exp)}")
+    if posted:
+        lines.append(f"🕒 Posted {posted}")
     mode = apply_mode(job)
-    if mode:
-        lines.append({"easy": "📱 Easy Apply", "site": "💻 Company site"}[mode])
+    mode_txt = {"easy": " · 📱 Easy Apply", "site": " · 💻 Company site"}.get(mode, "")
+    lines.append(f"🔗 {_e(job.get('source'))}{mode_txt}")
     if isinstance(years, (int, float)) and years >= 1 and v.get("freshers_welcome"):
-        lines.append(f"🎯 Lists {years:g}+ yrs, but the post says skilled freshers are welcome: worth a try")
+        lines += ["", f"🎯 Lists {years:g}+ yrs, but freshers are welcome: worth a try"]
     why = v.get("fit_reason") or v.get("reason")
     if why:
-        lines.append(f"✅ {_e(why)[:300]}")
+        lines += ["", f"💡 {_e(why)[:260]}"]
     ins = v.get("apply_instructions")
     if isinstance(ins, dict) and ins.get("summary"):
-        lines.append(f"⚠️ <b>How to apply:</b> {_e(ins['summary'])[:300]}")
+        lines += ["", f"⚠️ <b>How to apply:</b> {_e(ins['summary'])[:300]}"]
     return "\n".join(lines)
 
 
@@ -426,14 +431,35 @@ def _push_marks(st: dict[str, Any]) -> int:
     for key, rec in read("applications.json").items():
         if isinstance(rec, dict) and rec.get("status") == "applied" and key.split(":", 1)[0] in _SOURCES:
             marks[key] = (str(rec.get("updated_at") or rec.get("applied_at") or ""), "applied")
-    since = st.get("marks_at") or ""
-    todo = sorted(((ts, uid, what) for uid, (ts, what) in marks.items() if ts > since))
+    since_seen = st.get("marks_at") or ""
+    since_applied = st.get("applied_at") or ""  # own cursor: Telegram's /dashboard counts applied jobs with their real time
+    seen_todo = sorted((ts, uid, what) for uid, (ts, what) in marks.items() if what == "seen" and ts > since_seen)
+    applied_todo = sorted((ts, uid, what) for uid, (ts, what) in marks.items() if what == "applied" and ts > since_applied)
+    names: dict[str, tuple[str, str]] = {}
+    if applied_todo:  # title + company so the cloud can list them and spot priority companies
+        from fresherpilot.jobs import apify_jobs
+
+        want = {uid for _ts, uid, _w in applied_todo}
+        for j in (apify_jobs.load_cache_shared() or {}).get("jobs") or []:
+            u = f"{j.get('source')}:{j.get('id')}"
+            if u in want:
+                names[u] = (str(j.get("title") or "")[:120], str(j.get("company") or "")[:80])
+
+    def ms(ts: str) -> int:
+        from datetime import datetime
+
+        try:
+            return int(datetime.fromisoformat(ts).timestamp() * 1000)
+        except Exception:  # noqa: BLE001
+            return 0
+
     sent = 0
-    for i in range(0, len(todo), 300):
-        chunk = todo[i:i + 300]
-        _cloud_call("/api/mark", {"marks": [[uid, what] for _ts, uid, what in chunk]}, timeout=40)
-        st["marks_at"] = chunk[-1][0]
-        sent += len(chunk)
+    for todo, cursor in ((seen_todo, "marks_at"), (applied_todo, "applied_at")):
+        for i in range(0, len(todo), 300):
+            chunk = todo[i:i + 300]
+            _cloud_call("/api/mark", {"marks": [[uid, what, ms(ts), *names.get(uid, ("", ""))] for ts, uid, what in chunk]}, timeout=40)
+            st[cursor] = chunk[-1][0]
+            sent += len(chunk)
     return sent
 
 
@@ -468,10 +494,10 @@ def cloud_loop(running: Callable[[], bool], on_new: Callable[[], Any] | None = N
             cloud_sync(on_new)
         except Exception:  # noqa: BLE001 — offline / Worker hiccup: next time
             pass
-        for _ in range(18):  # every 3 minutes
+        for _ in range(8):  # every 40 s (was 3 min): Easy Apply jobs close within the hour, so a new job must reach the app fast
             if not running():
                 return
-            time.sleep(10)
+            time.sleep(5)
 
 
 def test_message() -> None:

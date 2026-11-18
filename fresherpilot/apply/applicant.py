@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from fresherpilot.apply.answerbank import alias_match, alts as _alts, bank_answer
+
 ROOT = Path(__file__).resolve().parents[2]
 def _upath(name: str) -> Path:
     from fresherpilot.core import users
@@ -156,9 +158,20 @@ def match_option(value: str, options: list[str]) -> str:
     for o, n in norm.items():
         if v and min(len(v), len(n)) >= 2 and (within(v, n) or within(n, v)):
             return o
+    def _too_loose(o: str) -> bool:
+        """A one-word answer must not become a long option that merely resembles it (Nov 18, Micron: "India" -> "British Indian Ocean
+        Territory" when the real "India" was beyond the part of a long list we could read). Better empty than wrong."""
+        ow = _norm(o).split()
+        return len(v.split()) == 1 and len(ow) >= 3 and v not in ow
+
+    alias = alias_match(value, options)  # same meaning, different wording (India = IN = +91, Karnataka = KA, B.E. = Bachelor's...)
+    if alias and not _too_loose(alias):
+        return alias
     best = difflib.get_close_matches(v, list(norm.values()), n=1, cutoff=0.72)
     if best:
-        return next(o for o, n in norm.items() if n == best[0])
+        o = next(o for o, n in norm.items() if n == best[0])
+        if not _too_loose(o):
+            return o
     return ""
 
 
@@ -370,6 +383,14 @@ For each field return {id, value, needs_review}:
 - Demographics: use the profile's diversity values (disability "No", veteran "not a protected veteran",
   Hispanic/Latino "No", race "Asian"). Gender, caste, religion: profile value if present, otherwise the
   "prefer not to say"/"decline" option if one exists, otherwise "".
+- SELF-RATINGS / PROFICIENCY (the candidate's instruction: present him at his best): any "rate yourself", skill-level
+  or confidence question gets a confident, favourable answer: on /10 give 8 for his core stack (Python, AI/ML, data,
+  backend, problem solving, DSA) and 7 for any other skill on the resume; never below 6 for a skill the resume
+  mentions; on /5 give 4; on level lists pick Advanced for the core stack, Intermediate otherwise, never
+  Beginner/lowest for a skill he lists. Count project and internship use as experience with a skill. Answer
+  optional fields too when the facts allow. Skills and tools the resume does NOT mention stay honest ("No" / 0).
+- Identity documents and licences (passport, driving licence, visa, security clearance) that are NOT in the profile:
+  return "" with needs_review=true, never "Yes".
 - If the true answer is not in the profile/resume (e.g. expected salary not set, unknown personal details),
   return "" with needs_review=true. Do NOT guess.
 - needs_review=true also for anything you are unsure about.
@@ -721,6 +742,8 @@ def autofill(fields: list[dict[str, Any]], job_context: str = "", job: dict[str,
             if re.search(pattern, f.get("label", ""), re.I) and not set_value:
                 opt = next((o for o in (f.get("options") or []) if decline.search(o)), "")
                 a.update(value=opt, needs_review=not opt, source="profile")
+        if f.get("type") == "combobox" and not f.get("options") and a.get("value"):
+            a["alts"] = _alts(a["value"])  # typeahead dropdown: the extension tries these wordings too
         label = f"{f.get('label', '')} {' '.join(f.get('options') or [])}"
         if f.get("type") == "checkbox" and CONSENT.search(label) and not re.search(r"newsletter|marketing|promotional|job alerts", label, re.I):
             a.update(value="", needs_review=True, note="agreement: decide yourself")
@@ -740,12 +763,25 @@ def _autofill(fields: list[dict[str, Any]], job_context: str = "", job: dict[str
         if f.get("type") == "file":
             continue
         custom = next((v for q, v in profile.get("custom_answers", {}).items() if _norm(q) and _norm(q) == _norm(f.get("label", ""))), None)
-        direct = custom if custom is not None else (_job_answer(f, job) or _direct_answer(f, rules))
+        direct = custom if custom is not None else _job_answer(f, job)
+        review = False
+        from_bank = False
+        if direct is None:
+            hit = bank_answer(f, profile)  # answer bank: standard questions in many wordings (country, sponsorship, education...)
+            if hit is not None:  # value "" = a known question the profile has no answer to: left blank for the user, never guessed by the AI
+                direct, review = hit
+                from_bank = True
+                if direct.startswith("CTC:"):
+                    direct = _ctc_for(f, direct[4:])
+                if direct and f.get("options") and not _clean(f, direct):
+                    direct = None  # no option means the same thing: the AI sees the options
+        if direct is None:
+            direct = _direct_answer(f, rules)
         if direct is None:
             for_ai.append(f)
         else:
             value = _clean(f, direct) if direct else ""
-            answers[f["id"]] = {"id": f["id"], "value": value, "source": "profile", "needs_review": not value}
+            answers[f["id"]] = {"id": f["id"], "value": value, "source": "profile", "needs_review": review or (not value and not from_bank)}
     try:
         ai = _llm_answers(for_ai, profile, job_context)
     except Exception as exc:  # noqa: BLE001 — profile answers are still useful without the AI

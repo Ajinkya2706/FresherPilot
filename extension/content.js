@@ -183,7 +183,14 @@
     qsa("[data-jf-group]").forEach((n) => delete n.dataset.jfGroup);
     const fields = [];
     const doneGroups = new Set();
-    const controls = qsa("input, textarea, select, [role=radio], [role=checkbox], [role=combobox]:not(input), [aria-haspopup=listbox]:not(input), [contenteditable]:not([contenteditable=false]), [role=textbox]:not(input):not(textarea)");
+    const allControls = qsa("input, textarea, select, [role=radio], [role=checkbox], [role=combobox]:not(input), [aria-haspopup=listbox]:not(input), [contenteditable]:not([contenteditable=false]), [role=textbox]:not(input):not(textarea)");
+    // Nov 17: with LinkedIn's Easy Apply dialog open, the page's own Search box (a role=combobox input in the header) was collected as a "field":
+    // the fill typed into it and the tab jumped to the search results ("jobs · india"). While a modal is open, only ITS controls count.
+    let modal = null;
+    for (const d of document.querySelectorAll("dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true], .artdeco-modal, .jobs-easy-apply-modal")) {
+      try { if (isVisible(d) && (d.innerText || "").trim().length > 30) modal = d; } catch { /* ignore */ }
+    }
+    const controls = modal ? allControls.filter((c) => modal.contains(c)) : allControls;
 
     for (const el of controls) {
       if (el.dataset.jfSkip) continue;
@@ -493,7 +500,7 @@
   //     candidate value, so a few rounds always find one the box accepts.
   // Returns the number of fields it changed.
   window.__jfForceFill = async () => {
-    const NEG = /sponsor|visa|disab|convict|criminal|felony|non-?compete|terminat|fired|relative|related to|currently employed|employee of|politically|pending/i;
+    const NEG = /sponsor|visa|disab|convict|criminal|felony|non-?compete|terminat|fired|relative|related to|currently employed|employee of|politically|pending|previously (been )?(employed|worked)|formerly|ever (been )?(employed|worked)|employed by|worked (for|at|with)|applied (on|for|to).{0,40}(before|previous|prior|occasion)|friends?\/relatives|referred|referral|bond(ed)?|board of directors|export control|u\.?s\.? (federal|government)|government (employee|official)|security clearance|conflict of interest|lawsuit|litigation|garnish|bankrupt/i;
     const root = document.querySelector("dialog[open]") || document;
     const setVal = (el, v) => {
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : el.tagName === "SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
@@ -517,6 +524,7 @@
     // ---- text-like boxes
     for (const el of root.querySelectorAll("input:not([type=hidden]):not([type=radio]):not([type=checkbox]):not([type=file]):not([type=submit]):not([type=button]), textarea")) {
       if (el.closest("#__jf_status") || el.disabled || !el.offsetParent) continue;
+      if (el.getAttribute("role") === "combobox" || el.getAttribute("aria-autocomplete") === "list") continue;  // search-style dropdown: typing junk into it picked wrong options (Micron: country)
       const label = labelOf(el).toLowerCase();
       if (/optional/.test(label) && !el.value) continue;
       const err = errorOf(el);
@@ -537,6 +545,7 @@
         let cands;
         if (/ctc|salary|compensation|lpa|stipend|expected/.test(label)) cands = /current|present|last|existing/.test(label) ? ["0", "1"] : ["400000", "4", "300000"];
         else if (/notice|joining|available|days/.test(label)) cands = ["0", "15", "1"];
+        else if (/name|manager|supervisor|location|city|place|employee id|employee number|department|designation|reason|why|describe|explain|specify|please state|company|organi[sz]ation/.test(label)) cands = ["NA", "Not applicable", "N/A"];
         else cands = ["0", "1", "2", "3"];
         if (/larger than 0|greater than 0|positive|at least 1/.test(err)) cands = cands.filter((c) => Number(c) > 0).concat(["1", "2"]);
         const m = err.match(/between (\d+) and (\d+)/i);
@@ -649,6 +658,10 @@
             ok = await apply(entry, a.value);
           } catch (e) {
             ok = false;
+          }
+          // typeahead dropdown that does not list "India" but "IN" / "+91": try the other wordings of the same answer
+          for (const alt of ok ? [] : (a.alts || [])) {
+            try { if (await apply(entry, alt)) { ok = true; break; } } catch {}
           }
         }
         if (ok && !a.needs_review) summary.filled++;
