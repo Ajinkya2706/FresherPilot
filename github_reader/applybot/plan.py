@@ -125,10 +125,15 @@ def _j(obj: Any) -> str:
 def facts_text(profile: dict[str, Any], limit_resume: int = 3500) -> str:
     p, j = profile.get("personal", {}), profile.get("job_preferences", {})
     edu, exp = profile.get("education") or [], profile.get("experience") or []
+    j = dict(j)
+    for k in ("current_ctc_lpa", "current_fixed_salary", "current_salary"):   # portals reject 0 ("must be greater than 0"): the owner's rule is to enter 1
+        if k in j and str(j[k]).strip() in ("", "0", "0.0", "none", "None", "nil", "NA", "N/A"):
+            j[k] = "1"
     lines = [f"Name: {p.get('full_name')} ({p.get('first_name')} {p.get('last_name')}); email {p.get('email')}; phone {p.get('phone_country_code')} {p.get('phone')}; "
              f"address: {p.get('address')}, {p.get('city')}, {p.get('state')}, {p.get('country')} {p.get('pincode')}; DOB {p.get('date_of_birth')}; gender {p.get('gender')}; nationality {p.get('nationality')}",
              f"Links: {_j(profile.get('links') or {})}",
              f"Preferences: {_j(j)}",
+             "SALARY RULE: the candidate is a fresher with no salary, but portals refuse 0. For ANY current / last / ending / fixed / variable salary field enter 1 (never 0, never blank); expected salary comes from Preferences.",
              f"Diversity / EEO answers: {_j(profile.get('diversity') or {})}",
              f"Saved answers: {_j(profile.get('custom_answers') or {})}",
              f"EDUCATION ({len(edu)} entries, most recent first): {_j(edu)}",
@@ -163,6 +168,15 @@ def history_text(mem: dict[str, Any], n: int = 8) -> str:
 def ask_ai(ai, job: dict, profile: dict, mem: dict[str, Any], snap: dict) -> dict | None:
     user = (f"GOAL: apply to '{job.get('title', '')}' at '{job.get('company', '')}'.\n\nCANDIDATE FACTS:\n{facts_text(profile, 3500 if needs_resume(snap) else 0)}\n\n"
             f"PORTAL MEMORY: facts={json.dumps(mem['facts'], ensure_ascii=False)[:700]}; your notes: {mem.get('notes', '(none)')}\n\n"
+            f"FILES: the candidate's resume (PDF) IS available. To attach it use do=upload with the id of the resume/CV file field (any 'Attach resume / Upload CV' control). "
+            f"Never ask for the resume or say you are waiting for it.\n"
+            f"DEFAULTS (never use ask for these): 'current company / employer' = his most recent employer in the facts, else 'Fresher'; 'current title' = his most recent "
+            f"role, else 'Fresher'; 'LinkedIn/portfolio' left empty if not in the facts and optional; 'how did you hear' = 'Company website' / 'Job board'; "
+            f"a required free-text with no fact = a short honest line from his real projects. EXPERIENCE fields: a NUMBER of years/months with a tool or in a role he has "
+            f"not worked in professionally = 0 (if the page rejects 0, type 1); a text box asking for his experience = 'Fresher, no full-time experience yet; hands-on with "
+            f"<that skill> through projects and internships, eager to learn on the job'; never leave a required experience field empty and never ask the owner. SALARY / CTC / "
+            f"notice numbers: current CTC 0, expected as in the facts; if the page refuses 0 use 1. When the page shows an error on a field after your answer, change the "
+            f"value in the direction the error asks (end date equal to start date -> end = one month later; value too low -> next higher) instead of repeating it. Use ask ONLY for a one-time secret/code or a fact that cannot be guessed (e.g. a government ID).\n\n"
             f"HISTORY:\n{history_text(mem)}\n\nCURRENT PAGE:\n{page_view(snap)}")
     try:
         res = ai(build_system(snap), user, SCHEMA)

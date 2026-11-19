@@ -23,8 +23,11 @@ from typing import Any
 
 _RULES: list[tuple[str, re.Pattern[str]]] = [(c, re.compile(p, re.I)) for c, p in [
     ("closed_posting", r"no longer accepting|not (currently )?accepting|applications? (are )?closed|unavailable or removed|"
-                       r"job (has )?expired|position (has been )?filled|job removed"),
-    ("already_applied", r"already applied|you applied|applied (to|earlier)"),
+                       r"job (has )?expired|position (has been )?filled|job removed|closed or removed|removed or the job id|posting (is|has been) (closed|removed)|"
+                       r"no specific job listing"),
+    ("handed_off", r"handed to the local playwright runner|handed to the cloud"),
+    ("already_applied", r"already applied|you applied|applied (to|earlier)|already (been )?submitted|application submitted"),
+    ("not_eligible", r"not eligible|requires .* location|location (mismatch|requirement)"),
     ("limit_reached", r"daily limit|limit reached|quota"),
     ("captcha", r"captcha|security check|verify you are human|turnstile"),
     ("otp_needed", r"\botp\b|verification code|verify your email|one[- ]time"),
@@ -32,12 +35,12 @@ _RULES: list[tuple[str, re.Pattern[str]]] = [(c, re.compile(p, re.I)) for c, p i
     ("validation_loop", r"no progress|same step repeated|validation"),
     ("wrong_page", r"not the (actual|specific) job|'not found'|not found|isn't available|homepage|fraud-reporting"),
     ("too_many_steps", r"too many steps"),
-    ("stuck_timeout", r"took over|stuck|timed? ?out"),
+    ("stuck_timeout", r"took over|stuck|timed? ?out|no result within|killed"),
     ("page_error", r"frame with id|error page|kept reloading|keeps reloading|tab (was )?closed|no tab with id|no current window|"
-                   r"tabs cannot be edited|cannot read properties"),
+                   r"tabs cannot be edited|cannot read properties|extension stopped answering"),
     ("button_not_found", r"chosen button disappeared|no (visible|listed)|couldn't find a safe button|no clickable"),
     ("needs_human", r"answer:|assessment|email a link|project|upload|cv upload|requires the candidate|needs you:|"
-                    r"easy apply (alone )?(is|isn|not)|does not display an apply|whatsapp|official .* website|apply (via|using)"),
+                    r"easy apply (alone )?(is|isn|not)|does not display an apply|redirect(ed)? (confirmation|to the company)|whatsapp|official .* website|apply (via|using)"),
     ("user_skipped", r"by you"),
 ]]
 
@@ -51,7 +54,7 @@ def classify(detail: str, event: str = "") -> str:
 
 
 # Failure codes where retrying cannot help (job-state facts) vs those worth a re-try or a code fix
-TERMINAL = {"closed_posting", "already_applied", "limit_reached", "user_skipped"}
+TERMINAL = {"not_eligible", "closed_posting", "already_applied", "limit_reached", "user_skipped", "handed_off"}
 
 
 def summarize(log: list[dict[str, Any]]) -> dict[str, Any]:

@@ -231,15 +231,21 @@ _made_dirs: set[str] = set()  # user folders already created (mkdir on every fil
 def write_atomic(target: Path, text: str) -> None:
     """Write a whole file, then swap it in: anyone reading never sees a half-written file
     (a half-read jobs/verdicts file looked empty, and saving after that would lose data)."""
-    tmp = target.with_name(target.name + ".tmp")
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")  # unique: two writers shared one temp file and one lost it
     tmp.write_text(text, encoding="utf-8")
-    for attempt in range(20):
+    try:
+        for attempt in range(20):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:  # Windows: another process has the file open this instant
+                time.sleep(0.05 * (attempt + 1))
+        os.replace(tmp, target)
+    finally:
         try:
-            os.replace(tmp, target)
-            return
-        except PermissionError:  # Windows: another process has the file open this instant
-            time.sleep(0.05 * (attempt + 1))
-    os.replace(tmp, target)
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def path(name: str) -> Path:

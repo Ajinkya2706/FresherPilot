@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from fresherpilot.apply import applicant
-from fresherpilot.jobs import llm_filter
+from fresherpilot.jobs import archive, llm_filter
 from fresherpilot.outreach import messages as outreach
 from fresherpilot.jobs import visited
 
@@ -26,7 +26,7 @@ def _day(iso: str | None) -> date | None:
 def build(jobs: list[dict[str, Any]]) -> dict[str, Any]:
     today = datetime.now().astimezone().date()
     days = [today - timedelta(days=i) for i in range(DAYS - 1, -1, -1)]
-    by_uid = {visited.uid(j): j for j in jobs}
+    by_uid = {j.get("uid") or visited.uid(j): j for j in jobs}  # `jobs` = the packed list (already rated / visited-stamped)
 
     apps = applicant.applications()
     applied = Counter(_day(a.get("applied_at")) for a in apps.values())
@@ -38,9 +38,13 @@ def build(jobs: list[dict[str, Any]]) -> dict[str, Any]:
     seen = visited.load_all()
     reviewed = Counter(_day(at) for key, at in seen.items() if not key.startswith("tc:"))
 
-    keep = [j for j in jobs if (llm_filter.cached_verdict(j) or {}).get("decision") == "keep"]
+    keep = [j for j in jobs if j.get("status") == "keep"]
     matches = Counter(_day(j.get("first_seen")) for j in keep)
-    pending = sum(1 for j in jobs if llm_filter.cached_verdict(j) is None)
+    pending = sum(1 for j in jobs if j.get("status") == "unchecked")
+    for iso, n in archive.daily_kept().items():  # approved jobs that moved to cold storage still count
+        d = _day(iso + 'T12:00:00')
+        if d:
+            matches[d] += n
 
     series = [
         {"date": d.isoformat(), "applied": applied[d], "emails": emails[d], "whatsapp": whatsapp[d],
@@ -76,7 +80,7 @@ def build(jobs: list[dict[str, Any]]) -> dict[str, Any]:
             "outreach_week": total(emails, 7) + total(whatsapp, 7),
             "outreach_total": len(sent),
             "reviewed_today": reviewed[today],
-            "new_matches": sum(1 for j in keep if not visited.visited_at(j, seen)),
+            "new_matches": sum(1 for j in keep if not j.get("visited_at")),
             "pending_ai": pending,
             "interviews": statuses["interview"],
             "offers": statuses["offer"],
@@ -86,5 +90,6 @@ def build(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         "sources": dict(sources.most_common()),
         "recent": recent,
         "ai_tokens_today": sum((usage.get("models") or {}).values()) if isinstance(usage, dict) else 0,
+        "archive": archive.totals(),
         "caps": {"email": outreach.DAILY_EMAIL_CAP, "whatsapp": outreach.DAILY_WHATSAPP_CAP},
     }

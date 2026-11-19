@@ -943,17 +943,20 @@ def applications() -> dict[str, Any]:
     return _load_json(_upath("applications.json"))
 
 
-def set_application(uid: str, status: str | None, note: str | None = None) -> dict[str, Any]:
+def set_application(uid: str, status: str | None, note: str | None = None, keys: list[str] | None = None,
+                    at: str | None = None) -> dict[str, Any]:
     data = applications()
     if not status:
         data.pop(uid, None)
     else:
         entry = data.get(uid, {})
-        entry.setdefault("applied_at", datetime.now(timezone.utc).isoformat())
+        entry.setdefault("applied_at", at or datetime.now(timezone.utc).isoformat())
         entry["status"] = status
         entry["updated_at"] = datetime.now(timezone.utc).isoformat()
         if note is not None:
             entry["note"] = note
+        if keys:  # fingerprints of the job: its copies on other boards / reposts count as applied too
+            entry["keys"] = sorted(set(entry.get("keys") or []) | set(keys))
         data[uid] = entry
     _save_json(_upath("applications.json"), data)
     return data.get(uid, {})

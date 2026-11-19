@@ -349,6 +349,8 @@ def cloud_sync(on_new: Callable[[], Any] | None = None) -> dict[str, int]:
         st = json.loads(_sync_path().read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         st = {"jobs_since": 0, "actions_since": 0}  # first time: everything the cloud found (merge skips known jobs)
+    if st.get("actions_fix") != 3:  # one-time replay: taps of jobs missing from the cache used to be dropped (Nov 19)
+        st["actions_fix"], st["actions_since"] = 3, 0
     # Tell the cloud which LinkedIn / Indeed jobs this laptop already read, so the GitHub reader (which takes
     # over when the laptop goes quiet) doesn't read and AI-check them again. At most 400 per heartbeat.
     since = st.get("seen_since") or (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
@@ -394,10 +396,16 @@ def cloud_sync(on_new: Callable[[], Any] | None = None) -> dict[str, int]:
         st["actions_since"] = max(st["actions_since"], int(a["n"]))
         job = _find_job(a["uid"]) or _find_same_job(a)
         if not job:
-            continue
+            # not in the live cache (moved to cold storage, or only the cloud ever had it): mark it by its id anyway,
+            # otherwise the tap is lost for good (Nov 19: 13 "Applied" taps never reached the app)
+            src, _, jid = str(a["uid"]).partition(":")
+            job = {"source": src, "id": jid, "title": a.get("title") or str(a["uid"]), "company": a.get("company") or "",
+                   "description": a.get("description") or ""}
         visited.mark([job], True)
         if a["action"] == "a":
-            applicant.set_application(visited.uid(job), "applied")
+            # the tapped id AND the app's copy of the same job (another board / id): the list shows "applied" per id
+            for u in {str(a["uid"]), visited.uid(job)}:
+                applicant.set_application(u, "applied", keys=visited.keys(job)[2:], at=_tap_time(a))
     pushed = 0
     try:
         pushed = _push_marks(st)
@@ -513,6 +521,21 @@ def _find_job(uid: str) -> dict[str, Any] | None:
     from fresherpilot.server import _normalized_jobs
 
     return next((j for j in _normalized_jobs(load_cache()) if visited.uid(j) == uid), None)
+
+
+def _tap_time(a: dict[str, Any]) -> str | None:
+    """ISO time of a Telegram tap (so a replay does not stamp old applications as today)."""
+    from datetime import datetime, timezone
+
+    v = a.get("at")
+    try:
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(v / 1000 if v > 1e11 else v, timezone.utc).isoformat()
+        if isinstance(v, str) and v:
+            return datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+    except (ValueError, OSError):
+        pass
+    return None
 
 
 def _on_button(q: dict[str, Any]) -> None:

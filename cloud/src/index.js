@@ -799,6 +799,7 @@ async function srcApify(env, b) {
   const left = lim.limits.maxMonthlyUsageUsd - lim.current.monthlyUsageUsd;
   const daysLeft = Math.max(1, Math.ceil((Date.parse(lim.monthlyUsageCycle.endAt) - now()) / DAY));
   const daily = Math.max(0, left / daysLeft);
+  await warnApifyCredit(env, b, left, lim.monthlyUsageCycle.endAt);
   for (const job of apifyJobsDue(st, env)) {
     // Each run may spend at least MIN_RUN (most cost far less: spend is counted at the real cost), never more
     // than what's left of today's budget.
@@ -835,7 +836,12 @@ async function srcApify(env, b) {
     }
     const res = await b.fetch(`${APIFY}/acts/${actor.replace("/", "~")}/runs?maxTotalChargeUsd=${cap.toFixed(3)}&timeout=900`, {
       method: "POST", headers: { ...auth.headers, "Content-Type": "application/json" }, body: JSON.stringify(input) });
-    const data = (await res.json()).data || {};
+    const body = await res.json().catch(() => ({}));
+    const data = body.data || {};
+    if (!data.id) {  // never fail silently again (Nov 19: Naukri sat idle for hours with "ok, 0 added")
+      await setState(env, "ap", st);
+      throw new Error(`Apify did not start ${job.key} (HTTP ${res.status}): ${String(body.error?.message || body.error?.type || JSON.stringify(body)).slice(0, 200)}`);
+    }
     if (data.id) {
       st.runs[job.key] = { id: data.id, cap, at: now(), offset: 0 };
       st.spend[today] = (st.spend[today] || 0) + cap;  // reserved until the real cost is known
@@ -845,6 +851,23 @@ async function srcApify(env, b) {
   }
   await setState(env, "ap", st);
   return 0;
+}
+
+// Tell the owner BEFORE Naukri / paid reads stop, and when they have stopped (Nov 19: credit ran out at 06:04 and nobody knew for 8 hours).
+// One message per level per billing cycle: "low" under $0.80, "out" under $0.25 (the runs then stop on their own).
+async function warnApifyCredit(env, b, left, cycleEnd) {
+  const level = left < 0.25 ? "out" : left < 0.8 ? "low" : "ok";
+  await setState(env, "apify_credit", { left: +left.toFixed(3), level, at: now(), resets: cycleEnd });
+  if (level === "ok" || !env.TELEGRAM_CHAT_ID) return;
+  const sent = await getState(env, "apify_warn", {});
+  const cycle = String(cycleEnd || "").slice(0, 10);
+  if (sent.cycle === cycle && (sent[level] || (level === "low" && sent.out))) return;
+  const text = level === "out"
+    ? `⛔ <b>Naukri has stopped</b>: the Apify credit is used up ($${left.toFixed(2)} left of $5).
+No new Naukri jobs will arrive until you top up at console.apify.com/billing or the cycle resets (${cycle}). LinkedIn, Indeed, Telegram, Internshala and company pages keep running.`
+    : `⚠️ <b>Apify credit is low</b>: $${left.toFixed(2)} left. Naukri will stop in a few hours unless you top up (console.apify.com/billing) or slow it down.`;
+  const r = await tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true });
+  if (r.ok) await setState(env, "apify_warn", { ...(sent.cycle === cycle ? sent : {}), cycle, [level]: now() });
 }
 
 // ---------------------------------------------------------------- AI check (Groq, your keys)
@@ -1240,6 +1263,19 @@ function fpTag(url, uid) {
   } catch { return url; }
 }
 
+// Telegram limits callback_data to 64 BYTES: cut by bytes; a tap with a cut id is resolved by prefix (resolveUid)
+function cb(action, uid) {
+  let s = `${action}|${uid}`;
+  const enc = new TextEncoder();
+  while (enc.encode(s).length > 64) s = s.slice(0, -1);
+  return s;
+}
+async function resolveUid(env, uid) {
+  if (uid.length < 50) return uid;
+  const a = await env.DB.prepare("SELECT uid FROM alerts WHERE substr(uid, 1, ?) = ? LIMIT 1").bind(uid.length, uid).first();
+  return a?.uid || uid;
+}
+
 function buttons(uid, url, blogUrl, source, done) {
   const rows = [];
   if (/^https?:/.test(url || "")) {
@@ -1248,15 +1284,15 @@ function buttons(uid, url, blogUrl, source, done) {
     rows.push(row);
   }
   rows.push(done ? [{ text: done, callback_data: "noop|" }] : [
-    { text: "✅ Applied", callback_data: `a|${uid}`.slice(0, 64) }, { text: "👀 Seen", callback_data: `v|${uid}`.slice(0, 64) },
-    { text: "🚫 Not for me", callback_data: `x|${uid}`.slice(0, 64) }]);
+    { text: "✅ Applied", callback_data: cb("a", uid) }, { text: "👀 Seen", callback_data: cb("v", uid) },
+    { text: "🚫 Not for me", callback_data: cb("x", uid) }]);
   return rows;
 }
 
 // One alert per real job: claim its loose keys first (laptop + Worker share this table).
 // A job counts as "already shown" for 30 days: a repost within a month is skipped, one after that is
 // usually a new opening and is alerted again.
-const SHOWN_FOR = 30 * DAY;
+const SHOWN_FOR = 2 * DAY;  // was 30 days: repeats of a role were hidden from Telegram but still listed in the app (Nov 19)
 async function claim(env, keys) {
   if (!keys.length) return true;
   const t = now();
@@ -1269,17 +1305,21 @@ async function claim(env, keys) {
 async function sendAlert(env, b, { uid, text, url, blog_url, source, keys, company, title, apply_mode }) {
   const prior = await env.DB.prepare("SELECT uid FROM alerts WHERE uid = ?").bind(uid).first();
   if (prior) return false;
+  if ((await getState(env, "alerts_off", false)) || !env.TELEGRAM_CHAT_ID) return false;  // paused: keep the job claimable for later
   if (!(await claim(env, keys || []))) {  // the same job (repost / other board) was already alerted or seen
     await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, url, blog_url, source, state, at) VALUES (?, ?, ?, ?, ?, 'dup', ?)")
       .bind(uid, text, url || "", blog_url || "", source || "", now()).run();
     return false;
   }
-  if ((await getState(env, "alerts_off", false)) || !env.TELEGRAM_CHAT_ID) return false;
   const r = await tg(env, b, "sendMessage", { chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true,
                                                reply_markup: { inline_keyboard: buttons(uid, url, blog_url, source) } });
-  await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, url, blog_url, source, at) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(uid, text, url || "", blog_url || "", source || "", now()).run();
-  return !!r.ok;
+  if (!r.ok) {  // Telegram refused: give the claim back so the next tick retries this job instead of losing it
+    if ((keys || []).length) await env.DB.batch(keys.map((k) => env.DB.prepare("DELETE FROM claims WHERE k = ?").bind(k)));
+    return false;
+  }
+  await env.DB.prepare("INSERT OR IGNORE INTO alerts (uid, text, url, blog_url, source, at, message_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(uid, text, url || "", blog_url || "", source || "", now(), r.result?.message_id || null).run();
+  return true;
 }
 
 // Anything the owner sends the bot (a forwarded post of ANY channel, a digest, a pasted job, a link alone, or plain typing) is read
@@ -1403,13 +1443,19 @@ async function ingestForward(env, b, m, say) {
 
 async function onTelegram(env, update) {
   const b = new Budget(40);
+  if (update.update_id) {  // Telegram retries a webhook that answered slowly: never handle the same update twice
+    const last = await getState(env, "tg_last_update", 0);
+    if (update.update_id <= last) return;
+    await setState(env, "tg_last_update", update.update_id);
+  }
   const q = update.callback_query;
   if (q) {
     if (String(q.message?.chat?.id) !== String(env.TELEGRAM_CHAT_ID)) {
       await tg(env, b, "answerCallbackQuery", { callback_query_id: q.id, text: "This bot isn't linked to your account yet. Send /start for setup steps.", show_alert: true });
       return;
     }
-    const [action, uid] = String(q.data || "").split(/\|(.*)/s);
+    const [action, rawUid] = String(q.data || "").split(/\|(.*)/s);
+    const uid = rawUid ? await resolveUid(env, rawUid) : rawUid;
     const label = { a: "Marked as applied ✅", v: "Marked as seen 👀", x: "Hidden from new jobs 🚫" }[action];
     if (!label || !uid) { await tg(env, b, "answerCallbackQuery", { callback_query_id: q.id }); return; }
     if (action === "a") {
@@ -1419,12 +1465,12 @@ async function onTelegram(env, update) {
     }
     await env.DB.batch([
       env.DB.prepare("INSERT INTO actions (uid, action, at) VALUES (?, ?, ?)").bind(uid, action, now()),
-      env.DB.prepare("UPDATE alerts SET state = ? WHERE uid = ?").bind({ a: "applied", v: "seen", x: "hidden" }[action], uid),
+      env.DB.prepare("UPDATE alerts SET state = ? WHERE uid = ? AND (? = 'a' OR state IS NULL OR state NOT IN ('applied'))").bind({ a: "applied", v: "seen", x: "hidden" }[action], uid, action),
     ]);
     await tg(env, b, "answerCallbackQuery", { callback_query_id: q.id, text: label });
     const al = await env.DB.prepare("SELECT * FROM alerts WHERE uid = ?").bind(uid).first();
     await tg(env, b, "editMessageReplyMarkup", { chat_id: q.message.chat.id, message_id: q.message.message_id,
-      reply_markup: { inline_keyboard: buttons(uid, al?.url, al?.blog_url, al?.source, label) } });
+      reply_markup: { inline_keyboard: buttons(uid, al?.url, al?.blog_url, al?.source, al?.state === "applied" ? "Marked as applied ✅" : label) } });
     return;
   }
   const m = update.message;
@@ -1728,6 +1774,7 @@ async function ensureIndexes(env) {
       env.DB.prepare("CREATE INDEX IF NOT EXISTS alerts_at ON alerts(at)"),
       env.DB.prepare("CREATE INDEX IF NOT EXISTS actions_at ON actions(at)"),
     ]);
+    try { await env.DB.prepare("ALTER TABLE alerts ADD COLUMN message_id INTEGER").run(); } catch (_) { /* column exists */ }
     indexesOk = true;
   } catch (_) { /* D1 unavailable: next tick */ }
 }
@@ -1794,6 +1841,11 @@ async function route(req, env, ctx) {
       }
       if (st.length) await env.DB.batch(st);
       return json({ marked: st.length });
+    }
+    if (url.pathname === "/api/dups") {  // alerts held back as repeats: the app hides the same jobs so list and Telegram match
+      const since = +(url.searchParams.get("since") || 0);
+      const rows = (await env.DB.prepare("SELECT uid, at FROM alerts WHERE state = 'dup' AND at > ? ORDER BY at LIMIT 1000").bind(since).all()).results;
+      return json({ dups: rows });
     }
     if (url.pathname === "/api/actions") {
       const since = +(url.searchParams.get("since") || 0);

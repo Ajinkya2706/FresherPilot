@@ -64,6 +64,8 @@ def ctc_for(field: dict[str, Any], raw: str) -> str:
     if not m:
         return ""
     amount = float(m.group(0))
+    if amount == 0:
+        return "1"   # a fresher has no salary, but portals reject 0 ("must be greater than 0"): owner said enter 1 (Nov 19)
     lpa = amount / 100000 if amount >= 1000 else amount
     hint = f"{field.get('label', '')} {field.get('placeholder', '')} {field.get('hint', '')}".lower()
     if re.search(r"monthly|per month", hint):
@@ -97,7 +99,7 @@ def compact_profile(profile: dict[str, Any]) -> str:
     p, j, e = profile["personal"], profile["job_preferences"], profile.get("education", [])
     lines = [f"Name: {p.get('full_name')}; email {p.get('email')}; phone {p.get('phone_country_code')} {p.get('phone')}; {p.get('city')}, {p.get('state')}, {p.get('country')}",
              f"Experience: {j.get('total_experience_years')} years full-time; {j.get('relevant_experience')}",
-             f"Current CTC {j.get('current_ctc_lpa', '0')} LPA (not employed now: use 0 for current / last / ending salary); Expected CTC {j.get('expected_ctc_lpa')} LPA; notice {j.get('notice_period')}; relocate {j.get('willing_to_relocate')}; work authorization India: {j.get('authorized_to_work_in_india')}"]
+             f"Current CTC {j.get('current_ctc_lpa', '0')} LPA (not employed now: for current / last / ending salary enter 1, never 0: portals reject 0 as an invalid value); Expected CTC {j.get('expected_ctc_lpa')} LPA; notice {j.get('notice_period')}; relocate {j.get('willing_to_relocate')}; work authorization India: {j.get('authorized_to_work_in_india')}"]
     for x in e:
         lines.append(f"Education: {x.get('degree')} {x.get('field')}, {x.get('institution')}, {x.get('end_year')}, "
                      + (f"CGPA {x.get('cgpa')}" if x.get("cgpa") else "") + (f" {x.get('percentage')}%" if x.get("percentage") else ""))

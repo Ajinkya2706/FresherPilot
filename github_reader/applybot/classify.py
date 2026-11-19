@@ -51,7 +51,8 @@ def classify(s: dict) -> str:
         return "submitted"
     strong = re.search(r"you('ve| have) already applied|already applied (for|to) this|already submitted an application", text, re.I)
     open_form = len([f for f in fillable if f['kind'] != 'checkbox']) >= 6   # a big empty form is not an 'already applied' page (Micron asks 'Have you applied on any previous occasions?')
-    if (ALREADY.search(text) and (strong or not open_form)) or any(re.match(r"^(\W*)(applied|already applied|application submitted)(\W*)$", b["text"], re.I) for b in s["buttons"]):
+    # a page with password boxes is a sign-in / create-account page (Workday LSEG, Nov 18: its privacy text matched ALREADY and a job was reported applied)
+    if (ALREADY.search(text) and (strong or not (open_form or pw or len(fillable) >= 2 or re.search(r"step \d+ of \d+", text, re.I)))) or any(re.match(r"^(\W*)(applied|already applied|application submitted|view (my )?application)(\W*)$", b["text"], re.I) for b in s["buttons"]):
         return "already_applied"   # Indeed / Naukri show a greyed "Applied" button
     if CLOSED.search(text) and len(fillable) < 3 and not any(APPLY_WORDS.match(b["text"]) for b in s["buttons"] if not b["disabled"]):
         return "closed"

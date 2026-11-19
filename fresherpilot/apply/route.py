@@ -146,6 +146,23 @@ def classify(job: dict[str, Any]) -> dict[str, str]:
     return _result("needs_check", "unknown", host, ats, board)
 
 
+def _portal_url(url: str) -> str:
+    """`url` if it points at a company / ATS page (not a job board, not a link shortener / blog), else ""."""
+    h = host_of(url or "")
+    if h and not board_of_host(h) and not any(_matches(h, d) for d in NOT_A_PORTAL):
+        return url
+    return ""
+
+
+def site_url(job: dict[str, Any]) -> str:
+    """The company-site page to apply on (the local Playwright runner's target), or "" when the job is applied for on
+    the board itself. A Workday / Greenhouse / company link counts wherever the job was found: its own link
+    (Careers pages), or the link an Indeed / Naukri / Telegram copy carries as `blog_url` / `apply_url`."""
+    if job.get("apply_mode") == "easy":
+        return ""
+    return _portal_url(str(job.get("apply_url") or "")) or _portal_url(str(job.get("url") or "")) or _portal_url(str(job.get("blog_url") or ""))
+
+
 def classify_page(source: str, buttons: list[dict[str, str]], text: str = "") -> dict[str, str]:
     """The decisive answer from a rendered job page (live captures, Nov 18 2026). `buttons` = [{"id", "text", "aria"}].
       Naukri    button#apply-button = on Naukri (easy), button#company-site-button / "Apply on company site" = site

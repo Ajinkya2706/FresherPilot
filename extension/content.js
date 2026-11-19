@@ -337,9 +337,30 @@
     if (setter) setter.call(el, value);
     else el.value = value;
     // React, Angular and Vue all listen to these.
-    el.dispatchEvent(new Event("input", { bubbles: true }));
+    try { el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: String(value) })); }
+    catch { el.dispatchEvent(new Event("input", { bubbles: true })); }
     el.dispatchEvent(new Event("change", { bubbles: true }));
+    try { el.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); } catch { /* old engines */ }
     el.dispatchEvent(new Event("blur", { bubbles: true }));
+    try { el.blur(); } catch { /* not focusable */ }
+  }
+
+  // Did the page really keep what we typed? (React inputs often revert a value set without the right events.)
+  const sameText = (a, b) => clean(String(a)).toLowerCase().replace(/[\s()\-+]/g, "") === clean(String(b)).toLowerCase().replace(/[\s()\-+]/g, "");
+  async function setAndVerify(el, value) {
+    setNativeValue(el, value);
+    await new Promise((r) => setTimeout(r, 60));
+    if (el.isContentEditable || !("value" in el)) return true;
+    if (sameText(el.value, value) || (el.type === "number" && Number(el.value) === Number(value))) return true;
+    // second technique: select the text and let the browser insert it like a user would (fires every native event)
+    try {
+      el.focus(); el.select && el.select();
+      if (document.execCommand("insertText", false, String(value))) await new Promise((r) => setTimeout(r, 60));
+    } catch { /* ignore */ }
+    if (sameText(el.value, value)) return true;
+    // input masks / formatters (phone, dates) rewrite the value: accept when the digits agree
+    const digits = (x) => String(x).replace(/\D/g, "");
+    return digits(value).length >= 4 && digits(el.value) === digits(value);
   }
 
   function isChecked(el) {
@@ -453,6 +474,8 @@
       if (any) {
         sel.dispatchEvent(new Event("input", { bubbles: true }));
         sel.dispatchEvent(new Event("change", { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 40));
+        if (!sel.multiple) return wanted.includes(clean(sel.selectedOptions[0]?.textContent || "").toLowerCase());
       }
       return any;
     }
@@ -470,12 +493,15 @@
     }
     if (type === "checkbox") {
       const want = value === "true";
-      if (isChecked(els[0]) !== want) els[0].click();
-      return true;
+      if (isChecked(els[0]) !== want) {
+        els[0].click();
+        await new Promise((r) => setTimeout(r, 50));
+        if (isChecked(els[0]) !== want) { const lab = els[0].labels && els[0].labels[0]; if (lab) lab.click(); await new Promise((r) => setTimeout(r, 50)); }
+      }
+      return isChecked(els[0]) === want;
     }
     if (type === "combobox") return chooseComboOption(els[0], value);
-    setNativeValue(els[0], value);
-    return true;
+    return setAndVerify(els[0], value);
   }
 
   function toast(text) {

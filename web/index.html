@@ -1,134 +1,26 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
     <title>FresherPilot</title>
-    <link rel="stylesheet" href="/static/styles.css" />
-    <link rel="stylesheet" href="/static/ui.css" />
-    <script src="/static/ui.js"></script>
-      <link rel="stylesheet" href="/static/design.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c6cff'/%3E%3Cstop offset='1' stop-color='%2335d0ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M17 6 9 18h6l-1 8 8-12h-6z' fill='none' stroke='white' stroke-width='2.2' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <script>try{var t=JSON.parse(localStorage.getItem("fp.theme"));if(t)document.documentElement.dataset.theme=t;else if(matchMedia("(prefers-color-scheme: light)").matches)document.documentElement.dataset.theme="light"}catch(e){}</script>
+    <link rel="stylesheet" href="/static/css/fp.css" />
+    <link rel="stylesheet" href="/static/css/motion.css" />
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="/"><span class="logo" aria-hidden="true">JF</span>
-        <div><span class="brand-name">FresherPilot</span><p class="tagline" id="tagline">Fresher jobs matched to your resume</p></div></a>
-      <nav class="tabs" aria-label="Views">
-        <button type="button" class="tab" data-view="dashboard">Dashboard</button>
-        <button type="button" class="tab" data-view="jobs">Jobs <span id="tabNew" class="tab-badge" hidden></span></button>
-        <a class="tab" href="/autoapply" title="Auto-apply: progress, jobs waiting for you, controls">Auto-apply</a>
-      </nav>
-      <div class="fetch">
-        <select id="fetchRange" class="btn" title="How far back to look. Jobs you already have are never fetched again." aria-label="Fetch range">
-          <option value="latest">Latest (since last fetch)</option>
-          <option value="1">Past 1 hour</option>
-          <option value="3">Past 3 hours</option>
-          <option value="24">Past 24 hours</option>
-          <option value="all">All time (7 days)</option>
-        </select>
-        <button id="fetchBtn" type="button" class="btn primary">Fetch new jobs</button>
-        <details class="menu"><summary class="btn ghost" aria-label="More">More ▾</summary>
-          <div class="menu-panel">
-            <a href="/static/profile.html">Profile</a>
-            <a href="/account" id="userBtn" title="Settings: keys, search, password">Settings</a>
-            <button id="missedBtn" type="button" title="Paste a job link you found elsewhere: the app checks it had it, adds it if not, and logs the miss">Missed a job?</button>
-          </div>
-        </details>
-      </div>
-    </header>
-
-    <section id="pipeline" class="pipeline" aria-label="Pipeline: reading, AI rating, auto-apply (independent stages)">
-      <div class="stage" id="stRead"><h3>1 · Reading boards</h3><p class="big" id="stReadBig">…</p><p class="sub" id="stReadSub"></p></div>
-      <span class="arrow" aria-hidden="true">→</span>
-      <div class="stage" id="stRate"><h3>2 · AI rating</h3><p class="big" id="stRateBig">…</p><p class="sub" id="stRateSub"></p></div>
-      <span class="arrow" aria-hidden="true">→</span>
-      <div class="stage" id="stApply"><h3>3 · Auto-apply</h3><p class="big" id="stApplyBig">…</p><p class="sub" id="stApplySub"></p></div>
-    </section>
-
-    <div class="statusbar">
-      <p id="status" class="status">Loading…</p>
-      <p id="usage" class="status small" title="Groq's free tier allows 200,000 tokens per model per day"></p>
-      <div id="progress" class="progress" hidden><div id="progressFill"></div></div>
-    </div>
-    <section id="fetchCard" class="fetch-card" hidden aria-live="polite">
-      <div class="fc-head"><strong id="fcTitle">Fetching jobs…</strong><span id="fcEta" class="muted small"></span></div>
-      <div class="fc-bar"><i id="fcBar"></i></div>
-      <div id="fcSteps" class="fc-steps"></div>
-    </section>
-    <div id="setupBanner" class="setup-banner" hidden><strong id="setupText"></strong><a class="btn primary small" href="/onboarding">Finish setup</a></div>
-    <p id="errors" class="errors" hidden></p>
-    <section id="autoPanel" class="auto-panel" hidden>
-      <div class="auto-head">
-        <strong id="autoTitle">Auto-apply</strong>
-        <button type="button" id="autoStop" class="link-btn">Stop</button>
-        <button type="button" id="autoClose" class="link-btn">Hide</button>
-      </div>
-      <p id="autoNow" class="muted small"></p>
-      <div id="autoWaiting" class="howto-banner" hidden>
-        <strong id="autoWaitingText"></strong>
-        <div class="row">
-          <button type="button" id="autoContinue" class="btn primary small">Continue</button>
-          <button type="button" id="autoSkip" class="btn small">Skip this job</button>
-        </div>
-      </div>
-      <ul id="autoLog" class="auto-log"></ul>
-    </section>
-
-    <!-- ============================================================ dashboard -->
-    <section id="dashboardView" class="view" hidden>
-      <div id="dash" class="dash"><div class="sk-grid"><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div><div class="sk sk-tile"></div></div><p class="muted loading" style="padding:0 20px">Loading your dashboard…</p></div>
-    </section>
-
-    <!-- ============================================================ jobs -->
-    <section id="jobsView" class="view" hidden>
-      <dl class="stats" id="stats">
-        <div><dt>Relevant</dt><dd id="statKept">–</dd></div>
-        <div class="stat-new"><dt>New for you</dt><dd id="statNew">–</dd></div>
-        <div><dt>Filtered out</dt><dd id="statRejected">–</dd></div>
-        <div><dt>Last fetch</dt><dd id="statWhen">–</dd></div>
-        <p id="fetchReport" class="status small fetch-report"></p>
-      </dl>
-
-      <section class="toolbar" id="toolbar" hidden>
-        <input id="search" type="search" placeholder="Search title, company, skill…" aria-label="Search jobs" />
-        <select id="days" aria-label="Posted within">
-          <option value="">Any time</option>
-          <option value="1">Last 24h</option>
-          <option value="3">Last 3 days</option>
-          <option value="7">Last 7 days</option>
-        </select>
-        <div id="sources" class="chips" aria-label="Sources"></div>
-        <div class="toggles">
-          <label><input type="checkbox" id="hideVisited" /> Hide visited</label>
-          <label><input type="checkbox" id="hideApplied" /> Hide applied</label>
-          <label><input type="checkbox" id="showUnchecked" /> Pending AI check</label>
-          <label><input type="checkbox" id="showRejected" /> Filtered-out <span id="rejectedCount" class="muted"></span></label>
-          <button type="button" id="markAllBtn" class="link-btn">Mark all shown as visited</button>
-        </div>
-      </section>
-
-      <main class="split" id="split">
-        <aside class="list-pane">
-          <p id="resultCount" class="muted count"></p>
-          <ul id="list" class="job-list"><li class="sk-card"><div class="sk sk-line w80"></div><div class="sk sk-line w60"></div><div class="sk-row"><div class="sk sk-chip"></div><div class="sk sk-chip"></div></div></li><li class="sk-card"><div class="sk sk-line w80"></div><div class="sk sk-line w40"></div><div class="sk-row"><div class="sk sk-chip"></div><div class="sk sk-chip"></div></div></li><li class="sk-card"><div class="sk sk-line w60"></div><div class="sk sk-line w80"></div><div class="sk-row"><div class="sk sk-chip"></div></div></li></ul>
-        </aside>
-        <section class="detail-pane" id="detail" aria-live="polite">
-          <div class="placeholder">
-            <p>Select a job to see details and people to reach out to.</p>
-          </div>
-        </section>
-      </main>
-    </section>
-
-    <!-- ============================================================ outreach draft -->
-    <dialog id="outreachDialog" class="modal" aria-labelledby="orTitle">
-      <form method="dialog" id="orForm" class="modal-body"></form>
-    </dialog>
-
-    <div id="toast" class="toast" role="status" hidden></div>
-
-    <script src="/static/app.js"></script>
-    <script src="/static/dashboard.js"></script>
-    <script src="/static/outreach.js"></script>
+    <script src="/static/js/core.js"></script>
+    <script src="/static/js/ui.js"></script>
+    <script src="/static/js/dashboard.js"></script>
+    <script src="/static/js/today.js"></script>
+    <script src="/static/js/outreach.js"></script>
+    <script src="/static/js/jobs.js"></script>
+    <script src="/static/js/apply.js"></script>
+    <script src="/static/js/system.js"></script>
+    <script src="/static/js/settings.js"></script>
+    <script src="/static/js/fx.js"></script>
+    <script>FP.start();</script>
   </body>
 </html>

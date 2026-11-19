@@ -24,8 +24,11 @@ ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
 QUEUE: list[dict[str, Any]] = []
 SEEN: dict[str, float] = {}          # uid -> when it was queued (never twice within a day)
+STEPS: list[dict[str, Any]] = []   # live lines of the running company-site job
 STATE: dict[str, Any] = {"running": False, "current": None, "done": 0, "applied": 0, "needs_you": 0, "failed": 0}
 _worker: threading.Thread | None = None
+_proc: subprocess.Popen | None = None   # the running company-site job (so Stop can kill it)
+_cancel = False
 _MAX_MINUTES = 8                     # one job's time limit (the form-filling itself; a waiting window is left alone)
 
 
@@ -72,8 +75,9 @@ def _within_daily_cap(uid: str) -> bool:
     return True
 
 
-def enqueue(job: dict[str, Any], url: str, why: str = "") -> str:
-    """Queue one job for the local Playwright runner. Returns queued | exists."""
+def enqueue(job: dict[str, Any], url: str, why: str = "", manual: bool = False) -> str:
+    """Queue one job for the local Playwright runner. Returns queued | exists | capped | skipped.
+    `manual` = you picked this job yourself: the daily cap and the 24 h "already queued" rule do not apply."""
     from fresherpilot.apply import route
     from fresherpilot.core import users
 
@@ -85,11 +89,11 @@ def enqueue(job: dict[str, Any], url: str, why: str = "") -> str:
     # emoji headlines) or a post with no company
     if not company or company.lower() in ("unknown", "n/a", "na") or re.search(r"hiring (drive|2026|2027)|mega hiring|\d+ openings?|openings!|walk-?in|[🚀🚨🔥📢]", title, re.I):
         return "skipped"
-    if not _within_daily_cap(uid):
+    if not _within_daily_cap(uid) and not manual:
         return "capped"
     key = "k:" + re.sub(r"[^a-z0-9]+", " ", (company + " " + re.sub(r"\|.*$", "", title)).lower()).strip()   # the same posting from two feeds
     with _lock:
-        if now - SEEN.get(uid, 0) < 24 * 3600 or now - SEEN.get(key, 0) < 24 * 3600:
+        if not manual and (now - SEEN.get(uid, 0) < 24 * 3600 or now - SEEN.get(key, 0) < 24 * 3600):
             return "exists"
         SEEN[uid] = now
         SEEN[key] = now
@@ -101,9 +105,28 @@ def enqueue(job: dict[str, Any], url: str, why: str = "") -> str:
     return "queued"
 
 
+def stop_all() -> int:
+    """Stop button: empty the queue and kill the running company-site job (and its Chrome window). Returns how many were dropped."""
+    global _cancel
+    with _lock:
+        n = len(QUEUE) + (1 if STATE.get("running") else 0)
+        QUEUE.clear()
+        _cancel = True
+        proc = _proc
+    if proc and proc.poll() is None:
+        try:
+            if sys.platform == "win32":   # the runner AND the Chrome window it opened
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=15)
+            else:
+                proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
 def status() -> dict[str, Any]:
     with _lock:
-        return {**STATE, "queued": len(QUEUE), "queue": [{k: q[k] for k in ("uid", "title", "company", "ats")} for q in QUEUE[:20]]}
+        return {**STATE, "steps": STEPS[-25:], "queued": len(QUEUE), "queue": [{k: q[k] for k in ("uid", "title", "company", "ats")} for q in QUEUE[:20]]}
 
 
 def _work() -> None:
@@ -113,11 +136,20 @@ def _work() -> None:
                 STATE.update(running=False, current=None)
                 return
             item = QUEUE.pop(0)
+            STEPS.clear()
             STATE.update(running=True, current={k: item[k] for k in ("uid", "title", "company", "ats")})
+        global _cancel
+        with _lock:
+            _cancel = False
         try:
             status_, detail = _run_one(item)
         except Exception as exc:  # noqa: BLE001 — one job never stops the queue
             status_, detail = "failed", f"runner error: {str(exc)[:160]}"
+        if _cancel:   # you pressed Stop: not a failure, nothing is logged against the job
+            with _lock:
+                SEEN.pop(item["uid"], None)
+                STATE.update(running=False, current=None)
+            return
         _finish(item, status_, detail)
         with _lock:
             STATE["done"] += 1
@@ -130,6 +162,8 @@ def _run_one(item: dict[str, Any]) -> tuple[str, str]:
            "--company", item["company"], "--uid", item["uid"]] + (["--live"] if live else [])
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"})
+    global _proc
+    _proc = proc
     result: dict[str, Any] | None = None
     got = threading.Event()
     end = time.time() + _MAX_MINUTES * 60
@@ -137,6 +171,12 @@ def _run_one(item: dict[str, Any]) -> tuple[str, str]:
     def read() -> None:
         nonlocal result
         for line in proc.stdout or []:
+            if not line.startswith("RESULT "):   # the runner's own progress lines, shown live on the Auto-apply page
+                txt = re.sub(r"^\s*\d+s\s*", "", line.strip())[:170]
+                if txt:
+                    with _lock:
+                        STEPS.append({"at": datetime.now(timezone.utc).isoformat(), "uid": item.get("uid"), "who": "site", "text": txt})
+                        del STEPS[:-60]
             if line.startswith("RESULT ") and result is None:
                 try:
                     result = json.loads(line[7:])
@@ -165,7 +205,7 @@ def _finish(item: dict[str, Any], status_: str, detail: str) -> None:
 
     uid = item["uid"]
     event = _OUTCOME.get(status_, "failed" if status_ == "failed" else "skipped")
-    label = {"applied": "company site (Playwright)", "needs_you": f"needs you: {detail}", "blocked": f"needs you (bot check): {detail}"}.get(
+    label = {"applied": f"company site (Playwright): {detail[:160]}", "needs_you": f"needs you: {detail}", "blocked": f"needs you (bot check): {detail}"}.get(
         status_, detail)
     autoapply._log(event, {"uid": uid, "title": item["title"], "company": item["company"]}, label, uid)
     with _lock:

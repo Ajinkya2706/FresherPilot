@@ -105,15 +105,19 @@
     document.querySelectorAll(".__jfhint").forEach((n) => n.remove());
     document.querySelectorAll("[data-jf-hint]").forEach((n) => n.removeAttribute("data-jf-hint"));
     const sel = "a[href],button,[role=button],[role=link],input[type=submit],input[type=button],[role=menuitem],[role=tab],[role=radio],[role=option],summary,label.ssrc__label,div.sendMsg";
-    const all = [...document.querySelectorAll(sel)].filter((e) => rendered(e) && !e.closest("#__jf_status"));
+    // buttons built from div/span (Indeed's review page, many ATS): include them when their own text is a Submit/Next-style word
+    const STEP_WORD = /^(submit( application)?|review( your application)?|next|continue|apply( now)?|send( application)?|done|finish|save and continue|continue to next step)$/i;
+    const extra = [...document.querySelectorAll("div[class*=btn i],span[class*=btn i],div[class*=button i],span[class*=button i],div[tabindex='0'],span[tabindex='0'],[onclick]")]
+      .filter((e) => !e.matches(sel) && STEP_WORD.test(clean(e.innerText)) && !e.querySelector("button,a[href]"));
+    const all = [...document.querySelectorAll(sel), ...extra].filter((e) => rendered(e) && !e.closest("#__jf_status"));
     const dialog = currentDialog();
     // Real buttons (Next / Submit...) first, then links; dialog contents before the rest of the page.
     const isButton = (e) => e.tagName !== "A";
     const order = (list) => list.filter(isButton).concat(list.filter((e) => !isButton(e)));
-    const pool = dialog ? order(all.filter((e) => dialog.contains(e))).concat(order(all.filter((e) => !dialog.contains(e))).slice(0, 40)) : order(all);
+    const pool = dialog ? order(all.filter((e) => dialog.contains(e))).concat(order(all.filter((e) => !dialog.contains(e))).slice(0, 90)) : order(all);
     const letters = "asdfghjklqwertyuiopzxcvbnm";
     const items = [];
-    pool.slice(0, 160).forEach((e, i) => {
+    pool.slice(0, 320).forEach((e, i) => {
       const key = letters[Math.floor(i / 26) % 26] + letters[i % 26];
       e.setAttribute("data-jf-hint", key);
       const r = e.getBoundingClientRect();

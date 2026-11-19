@@ -13,7 +13,7 @@ from typing import Any
 
 from . import actions as act
 from . import brain, cloud, mail
-from .answers import resolve
+from .answers import match_option, resolve
 from .classify import APPLY_WORDS, CREATE_BTN, FINAL, NEXT, classify
 from .snap import locate, snapshot, state_key
 from .understand import wait_ready
@@ -201,14 +201,31 @@ class Run:
             return "applied", "Submitted and confirmed (the job page shows Applied)"
         return "needs_you", "Pressed submit, but the job page does not show Applied: check it by hand"
 
+    @staticmethod
+    def _portal_home(url: str) -> bool:
+        """The portal's front page / search page (Workday .../en-US/Careers), not a job or an application."""
+        from urllib.parse import urlparse
+        parts = [x for x in urlparse(url).path.split("/") if x and not re.fullmatch(r"[a-z]{2}-[A-Za-z]{2}", x)]
+        return len(parts) <= 1 and not re.search(r"/(job|jobs|apply|application|requisition)/", urlparse(url).path, re.I)
+
     def handle(self, kind: str, snap: dict, same: int) -> tuple[str, str] | None:
+        if kind == "job_detail":
+            self.seen_job = True
+        elif getattr(self, "seen_job", False) and kind in ("form", "unknown", "job_detail") and self._portal_home(snap["url"])                 and re.search(r"/job/|/apply", self.job.get("url", "")):
+            # Apply on a job page sent us to the portal's home: the posting no longer takes applications (Workday LSEG, Nov 18: the req was a year old).
+            # Wandering through the site's search for it burned minutes and never found it.
+            return "closed", "The posting no longer accepts applications: the portal sent Apply back to its home page"
         if kind == "submitted":
             from .classify import SUBMITTED
             m = SUBMITTED.search(snap["text"])
             self.log(f"submitted? url={snap['url'].split('?')[0][-70:]} matched='{(snap['text'][max(0, m.start() - 30):m.end() + 30] if m else '')[:110]}' headings={snap['headings'][:2]}")
             return "applied", "Submitted (the page confirms it)"
         if kind == "already_applied":
-            return "applied", "Already applied earlier"
+            # only a clear statement counts as applied; a vague match (or a greyed button we cannot see) is left to the owner, never reported as done
+            if re.search(r"you('ve| have) already applied|already applied (for|to) this|already submitted an application", snap["text"], re.I) or any(
+                    re.match(r"^(\W*)(applied|already applied|application submitted|view (my )?application)(\W*)$", b["text"], re.I) for b in snap["buttons"]):
+                return "applied", "Already applied earlier"
+            return "needs_you", "The page may say you already applied; check it by hand (not marked as applied)"
         if kind == "closed":
             return "closed", "The posting is closed or removed"
         if kind in ("captcha", "blocked"):
@@ -249,6 +266,11 @@ class Run:
         self.clicks[key] = self.clicks.get(key, 0) + 1
         if self.clicks[key] > 3:
             raise Stuck(f"pressing '{b['text']}' again and again changes nothing")
+        if self.dry and re.match(r"^(submit( (my )?application)?|send( application)?|finish|complete application|confirm( and submit)?)\s*$", b["text"].strip(), re.I):
+            # last line of defence for every click path (rules, AI plan, AI step): a dry run NEVER presses the final Submit
+            self.log(f"DRY RUN: not pressing '{b['text']}'")
+            self.dry_blocked = True
+            return
         self.log(f"click '{b['text']}'")
         act.click(self.page, locate(snap, b["id"]))
 
@@ -439,6 +461,29 @@ class Run:
             except Exception as ex:  # noqa: BLE001
                 self.log(f"named-error field '{label[:40]}': {str(ex)[:60]}")
 
+    def repair_invalid(self, snap: dict) -> int:
+        """A field the page marks invalid / shows an error for: read the error and set the next sensible value (end month = start + 1,
+        salary 0 -> 1, "enter a number" -> 0 / 1 ...). No AI, so it is instant and works on every portal. Max 3 tries per field."""
+        from . import repair
+        tried = getattr(self, "_repair_tries", {})
+        self._repair_tries = tried
+        n = 0
+        for f in snap["fields"]:
+            if f["kind"] in ("file", "radio", "checkbox", "select", "combo") or f.get("disabled") or f.get("readonly"):
+                continue
+            key = (snap["host"], f.get("block") or f.get("name") or f["label"][:60])
+            new = repair.repair_value(f, snap["fields"], tried.get(key, 0))
+            if new is None or new == str(f.get("value") or ""):
+                continue
+            tried[key] = tried.get(key, 0) + 1
+            try:
+                ok = act.set_text(self.page, locate(snap, f["id"]), new)
+            except Exception:  # noqa: BLE001
+                ok = False
+            self.log(f"repair '{f['label'][:40]}': {f.get('value', '')!r} -> {new!r} ({(f.get('error') or f.get('validation') or 'invalid')[:60]}) {'ok' if ok else 'failed'}")
+            n += 1 if ok else 0
+        return n
+
     HEAR = re.compile(r"linkedin|twitter|indeed|glassdoor|referr|friend|conference|job ?board|job portal|campus|career|website|social|search engine|google|blog|event|newspaper|naukri", re.I)
     HEAR_PREF = ["linkedin", "job board", "job portal", "careers website", "career", "company website", "website", "internet", "social", "other"]
 
@@ -582,6 +627,8 @@ class Run:
         self.fill_rounds += 1
         self.untick_marketing(snap)
         self.fix_named_errors(snap)
+        if self.repair_invalid(snap):
+            self.page.wait_for_timeout(400)
         grouped = self.fill_checkbox_groups(snap)
         fields = [f for f in snap["fields"] if f["id"] not in grouped]
         # custom dropdowns: read their options first so the answer is matched to a real option
@@ -747,6 +794,42 @@ class Run:
         if getattr(self, "ai_pages", 0) >= 80:
             return "unavailable"
         self.ai_pages = getattr(self, "ai_pages", 0) + 1
+        # A page that only shows the portal header (no labelled field, no Next/Save/Apply button) is still being drawn: give it time before the AI
+        # sees it (Workday LSEG, Nov 18: right after "Continue Application" the AI judged the empty shell and quit with "no Apply button").
+        def _empty(sn: dict) -> bool:
+            return len([f for f in sn["fields"] if f["label"].strip()]) <= 1 and not any(
+                re.match(r"^(next|continue|save|submit|review|apply|send)", b["text"], re.I) for b in sn["buttons"] if not b["disabled"] and not b["link"])
+        for _ in range(4):
+            if not _empty(snap):
+                break
+            self.log("page looks empty (still loading): waiting before asking the AI")
+            self.page.wait_for_timeout(5000)
+            snap = snapshot(self.page)
+        # The page was re-read while we waited: it may now be a page the rules own (Workday drew "Create Account" 5-10 s after "Apply Manually",
+        # CBA Nov 19: the AI got it, typed the email and quit with "need a password"). Sign-in / account / code / closed / done pages are never the AI's:
+        # hand them back so the loop dispatches them to their handlers (which hold the portal password and the mail watcher).
+        now = classify(snap)
+        if now not in ("form", "unknown"):
+            self.ai_pages -= 1
+            self.log(f"page became '{now}' while waiting: handing it to the {now} handler")
+            return self.handle(now, snap, 0)
+        # Custom dropdowns show no options until opened: without them the AI invents a wording ("B.E.", "Yes") that is not in the list
+        # (CBA Workday Nov 19: "Undergraduate / Graduate / Postgraduate" looped for 6 minutes). Open each empty one once and read its list.
+        cache = self.__dict__.setdefault("_opt_cache", {})
+        n_read = 0
+        for f in snap["fields"]:
+            if f["kind"] == "combo" and not f["value"] and not f["options"] and f["label"].strip() and n_read < 14:
+                loc = locate(snap, f["id"])
+                try:
+                    if act._wd_multi(loc):   # search-style multiselect: its list is the search result, not a fixed set
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+                ck = (f.get("block") or "") + "|" + (f.get("name") or f["label"][:200])
+                if ck not in cache:
+                    n_read += 1
+                    cache[ck] = act.read_combo_options(self.page, loc)
+                f["options"] = list(cache[ck])
         pl = plan.ask_ai(self.ai, self.job, self.profile, self.mem, snap)
         if not pl:
             return "unavailable"
@@ -758,8 +841,11 @@ class Run:
         fields = {f["id"]: f for f in snap["fields"]}
         buttons = {b["id"]: b for b in snap["buttons"]}
         sets = ticks = 0
-        dropped, clicked = [], ""
+        dropped, clicked, failed_sets = [], "", []
         self.log(f"AI plan ({len(acts)}): {pl.get('note', '')[:120]}")
+        if any(a.get("do") == "_dropped" and "unknown field" in str(a.get("_drop", "")) for a in acts):   # say exactly what was refused and which fields exist
+            self.log("refused: " + "; ".join(f"{a.get('id')}={str(a.get('value', ''))[:14]!r} known={a.get('id') in fields}" for a in acts if a.get("do") == "_dropped")[:300])
+            self.log("date-like fields: " + ", ".join(f"{f['id']}|{f['kind']}|{f['label'][:14]}|{f.get('name', '')[:22]}|{f.get('placeholder', '')}" for f in snap["fields"] if re.search(r"from|to|month|year|date|mm|yyyy", f"{f['label']} {f.get('name', '')} {f.get('placeholder', '')}", re.I))[:700])
         for a in acts:
             do, i, v = a["do"], a.get("id", ""), str(a.get("value", ""))
             if do == "_dropped":
@@ -768,6 +854,12 @@ class Run:
             try:
                 if do == "set":
                     f = fields[i]
+                    if f["kind"] in ("combo", "select") and f.get("options") and not match_option(v, f["options"]):
+                        failed_sets.append(f"{f['label'][:40]}: '{v[:30]}' is not one of the options {[o[:40] for o in f['options'][:8]]}")
+                        dropped.append(f"set:{f['label'][:30]} value not in options")
+                        continue
+                    if f["kind"] in ("combo", "select") and f.get("options"):
+                        v = match_option(v, f["options"]) or v
                     if f["kind"] in ("text", "email", "tel", "number", "date", "textarea", "code"):
                         act.set_text(self.page, locate(snap, i), v)
                         sets += 1
@@ -775,6 +867,7 @@ class Run:
                         sets += 1
                     else:
                         dropped.append(f"set:{f['label'][:30]} not set")
+                        failed_sets.append(f"{f['label'][:40]}: could not be set to '{v[:30]}'" + (f" (options {[o[:40] for o in f['options'][:8]]})" if f.get("options") else ""))
                 elif do == "tick":
                     f = fields[i]
                     if act.apply_answer(self.page, snap, f, {"value": "true" if v.strip().lower() in ("true", "yes", "1", "checked") else "false", "source": "ai"}):
@@ -789,6 +882,13 @@ class Run:
                         return "needs_you", f"This page is a different job from '{self.job.get('title', '')}' ({snap.get('title', '')[:60]}): not applying to it"
                     if self.dry and re.match(r"^(submit|send application|send|finish|complete application|confirm)", buttons[i]["text"].strip(), re.I):
                         return "needs_you", "DRY RUN: everything filled, stopped before the final Submit"
+                    if failed_sets and re.match(r"^(next|continue|save|submit|review|send)", buttons[i]["text"].strip(), re.I):
+                        # a field was not accepted: moving on only produces the same error page. Look again; the AI is told what failed.
+                        self.mem["history"].append({"page": f"{kind} | {snap['title'][:40]}", "action": "(I did not press " + buttons[i]["text"].strip() + ": a field was not accepted)",
+                                                    "result": "failed: " + " | ".join(failed_sets)[:400]})
+                        self.log("not pressing the button: " + failed_sets[0][:150])
+                        self.page.wait_for_timeout(500)
+                        return None
                     self._close_pickers(snap)
                     self.press(snap, buttons[i])
                     clicked = buttons[i]["text"].strip()
@@ -803,6 +903,14 @@ class Run:
                     self.page.wait_for_timeout(3500)
                     break
                 elif do == "ask":
+                    # A question about WHERE a button is (or about a page that has no real field yet) means the portal is still drawing the page
+                    # (Workday LSEG, Nov 18: right after "Continue Application" the AI gave up with "where is the Apply button?"). Wait and look again.
+                    real_fields = [f for f in snap["fields"] if f["label"].strip() and f["kind"] not in ("file",)]
+                    if getattr(self, "_ask_waits", 0) < 4 and (re.search(r"(where|which|button|link|page|load)", v, re.I) or len(real_fields) <= 2):
+                        self._ask_waits = getattr(self, "_ask_waits", 0) + 1
+                        self.log(f"page may still be loading: waiting instead of asking ({self._ask_waits}/4)")
+                        self.page.wait_for_timeout(6000)
+                        return None
                     return "needs_you", "Needs a fact I don't have: " + v[:200]
                 elif do == "done":
                     return "applied", "Submitted (the AI judged the application complete: " + str(a.get("why", ""))[:120] + ")"

@@ -54,9 +54,49 @@ def _read(loc) -> str:
             return ""
 
 
+def _set_workday_date(page, loc, value: str) -> bool:
+    """Workday dates are spin buttons (Month, Year) with a drawn "MM / YYYY" on top: focus the Month box and type the digits, it jumps to Year by itself."""
+    nums = re.findall(r"\d+", str(value))
+    if len(nums) >= 3:        # 2026-08-01 / 01/08/2026: year first or day first
+        y = next((n for n in nums if len(n) == 4), nums[-1])
+        rest = [n for n in nums if n != y]
+        m = rest[1] if (len(rest) > 1 and len(nums[0]) == 2 and int(nums[0]) > 12) else rest[0]
+    elif len(nums) == 2:
+        y = next((n for n in nums if len(n) == 4), nums[1])
+        m = next(n for n in nums if n != y)
+    else:
+        return False
+    mm = f"{int(m):02d}"
+    wrap_js = "e => [...(e.closest('[data-automation-id*=dateInputWrapper],[data-automation-id*=formField]') || e.parentElement).querySelectorAll('input[role=spinbutton]')].map(i => i.value)"
+    for _ in range(2):
+        try:
+            year = loc.locator("xpath=ancestor::*[contains(@data-automation-id,'dateInputWrapper') or contains(@data-automation-id,'formField')][1]//input[@data-automation-id='dateSectionYear-input']").first
+            # Month first, then the Year box on its own (typing "082026" in one go made Workday push the last month digit into the year)
+            loc.evaluate("e => e.focus()")
+            page.keyboard.press("Control+A")
+            page.keyboard.type(mm, delay=120)
+            page.wait_for_timeout(200)
+            year.evaluate("e => e.focus()")
+            page.keyboard.press("Control+A")
+            page.keyboard.type(y, delay=120)
+            page.wait_for_timeout(250)
+            vals = loc.evaluate(wrap_js)
+            if len(vals) >= 2 and re.sub(r"\D", "", vals[0] or "").lstrip("0") == mm.lstrip("0") and re.sub(r"\D", "", vals[-1] or "") == y:
+                page.keyboard.press("Tab")
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 def set_text(page, loc, value: str) -> bool:
     """fill() first; if the page did not keep the value (masked / React inputs) retype it key by key; last resort: events through JS."""
     _scroll(loc)
+    try:
+        if loc.get_attribute("data-automation-id", timeout=1500) == "dateSectionMonth-input":
+            return _set_workday_date(page, loc, value)
+    except Exception:  # noqa: BLE001
+        pass
     for attempt in (0, 1, 2):
         try:
             if attempt == 0:
@@ -150,11 +190,37 @@ def choose_radio(page, snap: dict, field: dict[str, Any], value: str) -> bool:
         return click(page, loc)
 
 
+def _lists_open(page) -> bool:
+    try:
+        return bool(page.evaluate("""(sel) => Array.from(document.querySelectorAll(sel)).some((e) => { const q = e.getBoundingClientRect(), cs = getComputedStyle(e);
+            return q.width > 2 && q.height > 2 && cs.visibility !== 'hidden' && cs.display !== 'none' && (e.innerText || '').trim(); })""", OPTION_SEL))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def close_open_lists(page) -> None:
+    """Close every open dropdown list and WAIT until none is visible, before the next dropdown is opened. Workday leaves the earlier list in the page
+    for a moment (and Escape is not instant): reading options right after a click then returned the PREVIOUS dropdown's list (CBA, Nov 19: "highest
+    education" got Yes/No, the work-eligibility question got the partner companies). Same rule as the open-source Workday autofills (close, wait, open, take the NEW list)."""
+    for _ in range(3):
+        if not _lists_open(page):
+            return
+        try:
+            page.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001
+            return
+        for _ in range(15):
+            page.wait_for_timeout(100)
+            if not _lists_open(page):
+                return
+
+
 def visible_options(page, near=None) -> list[tuple[Any, str]]:
     """(locator, text) of the options of the dropdown that is open now: ONE page call reads every candidate (a per-element loop took minutes on Workday).
     Pages like Workday keep OLD lists in the DOM (off screen): with near=<the control> only options on the screen and beside that control count."""
     try:
         box = None
+        ctrl = ""
         if near is not None:
             try:
                 box = near.bounding_box(timeout=1500)
@@ -162,8 +228,8 @@ def visible_options(page, near=None) -> list[tuple[Any, str]]:
                 box = None
             if not box:
                 return []
-        rows = page.evaluate("""([sel, b]) => { const out = []; const els = Array.from(document.querySelectorAll(sel));
-            for (let i = 0; i < els.length && out.length < 150; i++) {
+        rows = page.evaluate("""([sel, b]) => { const els = Array.from(document.querySelectorAll(sel)); const cand = [];
+            for (let i = 0; i < els.length && cand.length < 400; i++) {
                 const e = els[i], q = e.getBoundingClientRect();
                 if (q.width < 2 || q.height < 2) continue;
                 const cs = getComputedStyle(e); if (cs.visibility === 'hidden' || cs.display === 'none') continue;
@@ -172,8 +238,20 @@ def visible_options(page, near=None) -> list[tuple[Any, str]]:
                     if (q.top < b.y - 480 || q.top > b.y + b.height + 480) continue;
                     if (q.right < b.x - 40 || q.left > b.x + b.width + 260) continue;
                 }
-                const t = (e.innerText || '').trim(); if (t) out.push([i, t]);
-            } return out; }""", [OPTION_SEL, box])
+                const t = (e.innerText || '').trim(); if (t) cand.push([i, t, e]);
+            }
+            if (!b || !cand.length) return cand.slice(0, 150).map((c) => [c[0], c[1]]);
+            // Pages like Workday keep the lists of EARLIER dropdowns in the DOM (still "visible"): the options of the list that was just opened are
+            // the ones of the ONE list (listbox) nearest to the clicked control. Group the candidates by list and keep the nearest group.
+            const groups = new Map();
+            for (const c of cand) { const g = c[2].closest('[role=listbox],ul,[data-automation-id=activeListContainer]') || c[2].parentElement; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(c); }
+            let best = null, bd = 1e9;
+            for (const [g, cs] of groups) {
+                const r = g.getBoundingClientRect();
+                const d = Math.min(Math.abs(r.top - (b.y + b.height)), Math.abs((r.bottom) - b.y));
+                if (d < bd) { bd = d; best = cs; }
+            }
+            return best.slice(0, 150).map((c) => [c[0], c[1]]); }""", [OPTION_SEL, box])
         loc = page.locator(OPTION_SEL)
         return [(loc.nth(i), t) for i, t in rows]
     except Exception:  # noqa: BLE001
@@ -183,8 +261,9 @@ def visible_options(page, near=None) -> list[tuple[Any, str]]:
 def read_combo_options(page, loc) -> list[str]:
     """Open a custom dropdown, read its options, close it (so the answer can be matched to a real option)."""
     try:
+        close_open_lists(page)
         click(page, loc)
-        for _ in range(8):
+        for _ in range(25):
             page.wait_for_timeout(100)
             opts = visible_options(page, loc)
             if opts:
@@ -213,9 +292,7 @@ def pick_in_scrolling_list(page, loc, names: list[str]) -> bool:
         box = None
     if not box:
         return False
-    if visible_options(page, loc):
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(100)
+    close_open_lists(page)
     click(page, loc)
     page.wait_for_timeout(350)
     for name in names:
@@ -404,9 +481,7 @@ def set_combo(page, loc, value: str, alts: list[str] | None = None) -> bool:
                   if re.search(r"[A-Za-z]{3,}", t) and not re.search(r"\([^)]*[A-Za-z]{3,}[^)]*\)", t)]
         if names and pick_in_scrolling_list(page, loc, names[:6]):
             return True
-    if visible_options(page, loc):   # a list left open by the PREVIOUS dropdown (Workday keeps it open after a choice) would swallow this click: close it first
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(120)
+    close_open_lists(page)   # a list left open by the PREVIOUS dropdown (Workday keeps it open after a choice) would swallow this click: close it first
     for attempt, v in enumerate(tries[:5]):
         try:
             if not visible_options(page, loc):

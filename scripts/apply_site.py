@@ -150,6 +150,21 @@ def main() -> int:
             detail = f"runner error: {str(exc)[:200]}"
         save_session()
         print("RESULT " + json.dumps({"status": status, "detail": detail[:500], "steps": run.steps[-12:]}), flush=True)
+        if status not in ("applied", "already_applied"):   # evidence for every run that did not finish: what the page looked like + the last steps
+            try:
+                import shutil
+                from datetime import datetime
+                from fresherpilot.apply import failures as _fl
+                fdir = ud / "failures" / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + re.sub(r"[^A-Za-z0-9_-]+", "_", a.uid or "job")[:60])
+                fdir.mkdir(parents=True, exist_ok=True)
+                shot = os.environ.get("APPLYBOT_SHOT")
+                if shot and os.path.exists(shot):
+                    shutil.copy(shot, fdir / "page.png")
+                (fdir / "meta.json").write_text(json.dumps({
+                    "uid": a.uid, "url": a.url, "status": status, "code": _fl.classify(detail, status), "detail": detail[:500],
+                    "steps": run.steps[-25:], "at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
         # Stay alive in the SAME window and take instructions: users/<id>/site_cmd/<uid>.json = {"answers": {"Employer": "..."}, "cmd": "continue"}.
         # Continuing re-enters the loop from the page that is open (no new sign-in, no new code mail).
         cmd_dir = ud / "site_cmd"

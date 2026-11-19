@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS alerts (          -- alerts sent (for /jobs and the b
   uid TEXT PRIMARY KEY,
   text TEXT, url TEXT, blog_url TEXT, source TEXT,
   state TEXT,                                -- NULL | applied | seen | hidden
+  message_id INTEGER,                        -- Telegram message of the alert (to edit its buttons later)
   at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS actions (         -- button taps, pulled by the laptop app

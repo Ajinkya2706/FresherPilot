@@ -350,6 +350,31 @@ fresherpilot/
 └── docs/                      ARCHITECTURE, DEPLOY, TARGET_COMPANIES, HISTORY, system_map.html
 ```
 
+## Old jobs: cold storage and how to get one back
+
+To keep the app fast, jobs first seen **more than 3 days ago** are moved out of the live cache (`users/<id>/jobs_cache.json`)
+into compressed files in `users/<id>/archive/` (`jobs_<date>.jsonl.gz`, one JSON job per line, with the AI verdict).
+Nothing is deleted. The move runs 90 s after the app starts and every 6 hours (`fresherpilot/jobs/archive.py`,
+`ARCHIVE_AFTER_DAYS`). It never moves jobs you applied to, jobs you emailed, or jobs the AI has not rated yet.
+
+What stays visible without loading the archive: applied / outreach numbers (kept in `applications.json` and
+`outreach_log.json`), the dashboard's daily "new matches" chart (per-day counts in `archive/stats.json`), your visited marks
+(`visited.json`) and the AI verdict cache (`llm_verdicts.json`).
+
+**If you need an old job:**
+- **Dashboard:** the "cold storage" card at the bottom has a search box (title, company, location words). Each result links to the original posting.
+- **API:** `GET http://localhost:8000/api/archive/search?q=python+developer&limit=40`.
+- **By hand:** `python -c "import gzip,json,glob; [print(json.loads(l)['title']) for f in glob.glob('users/*/archive/jobs_*.jsonl.gz') for l in gzip.open(f,'rt',encoding='utf-8')]"`.
+- **Put jobs back in the live list:** append the lines of an archive file to the `jobs` array of `users/<id>/jobs_cache.json` (app stopped), or just use the original link.
+- **Run the archive now / preview it:** `POST /api/archive/run` (add `?dry_run=true` to only count). `?days=N` archives jobs older than N days (default 3).
+- **Safety copy** from before the first run: `backup/data_2026-11-18/jobs_cache_before_archive.json` (delete it once you are happy).
+
+Duplicates: the ids of archived jobs are kept in `archive/seen.json` (about 1 MB, ids older than 45 days drop out). The readers and the
+merge step treat them as already known, so a board listing an archived posting again does not bring it back as new.
+
+Slow-app diagnosis: the server logs `[slow]` requests (> 1 s) and, when the event loop stalls for more than 0.7 s, writes every thread's
+stack to `logs/lag.txt`, which names the culprit.
+
 ## Troubleshooting
 
 | Symptom | Check |

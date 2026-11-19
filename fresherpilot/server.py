@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import faulthandler
+import gzip
 import json
 import os
 import re
@@ -158,6 +159,45 @@ def _trim_old_rejects(dry_run: bool = False) -> dict[str, int]:
         if done and not dry_run:
             users.write_atomic(apify_jobs._cache_path(), json.dumps(payload, indent=2))
     return {"trimmed": done, "chars_saved": saved}
+
+
+def _archive_old_jobs() -> dict[str, Any]:
+    """Jobs older than 3 days go to cold storage (users/<id>/archive); the live list stays small and fast."""
+    from fresherpilot.jobs import archive
+
+    try:
+        r = archive.run()
+    except Exception as exc:  # never break the checker over housekeeping
+        print(f"[archive] failed: {exc}", flush=True)
+        return {"error": str(exc)}
+    if r.get("archived"):
+        _PACK_MEMO.clear()
+        _LIGHT.clear()
+        print(f"[archive] moved {r['archived']} jobs older than {r['days']} days to {r.get('file')} ({r.get('mb_saved')} MB of text)", flush=True)
+    return r
+
+
+def _archive_loop() -> None:
+    time.sleep(90)  # let the first page load and the readers settle
+    while True:
+        _archive_old_jobs()
+        time.sleep(6 * 3600)
+
+
+@app.post("/api/archive/run")
+def archive_run(dry_run: bool = False, days: int = 3) -> dict:
+    from fresherpilot.jobs import archive
+
+    if dry_run:
+        return archive.run(days=days, dry_run=True)
+    return _archive_old_jobs() if days == 3 else archive.run(days=days)
+
+
+@app.get("/api/archive/search")
+def archive_search(q: str = "", limit: int = 40) -> dict:
+    from fresherpilot.jobs import archive
+
+    return {"results": archive.search(q, min(limit, 100)), **archive.totals()}
 
 
 _LIGHT: dict[str, Any] = {}
@@ -320,7 +360,8 @@ def _run_checker() -> None:
             checked += len(batch)
             _T()["check"].update(done=checked)
         global _LAST_TRIM
-        if time.time() - _LAST_TRIM > 6 * 3600:  # old rejected jobs keep only the first 1500 characters
+        if time.time() - _LAST_TRIM > 6 * 3600:
+            _archive_old_jobs()  # old rejected jobs keep only the first 1500 characters
             _LAST_TRIM = time.time()
             trimmed = _trim_old_rejects()
             if trimmed["trimmed"]:
@@ -558,6 +599,40 @@ app.add_middleware(UserContext)
 from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
 
 app.add_middleware(GZipMiddleware, minimum_size=1500)  # the job list is ~11 MB of JSON: ~1.5 MB compressed
+
+
+@app.middleware("http")
+async def slow_requests(request: Request, call_next):
+    t0 = time.perf_counter()
+    resp = await call_next(request)
+    dt = time.perf_counter() - t0
+    if dt > 1.0 and "/pending" not in request.url.path:  # the extension's long poll is meant to wait
+        print(f"[slow] {request.method} {request.url.path} {dt:.1f}s", flush=True)
+    return resp
+
+
+@app.on_event("startup")
+async def _lag_monitor() -> None:
+    """Event-loop stalls are what the UI shows as latency spikes: when one lasts > 0.7 s, dump every thread's stack
+    to logs/lag.txt so the culprit (a big JSON load, a regex pass...) is named instead of guessed."""
+    import asyncio
+
+    async def watch() -> None:
+        while True:
+            t0 = time.perf_counter()
+            await asyncio.sleep(0.25)
+            lag = time.perf_counter() - t0 - 0.25
+            if lag > 0.7:
+                print(f"[lag] event loop blocked {lag:.1f}s", flush=True)
+                try:
+                    with open(ROOT / "logs" / "lag.txt", "a", encoding="utf-8") as f:
+                        f.write("\n===== " + datetime.now().isoformat(timespec="seconds") + f" lag {lag:.1f}s =====\n")
+                        faulthandler.dump_traceback(file=f, all_threads=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(5)
+
+    asyncio.create_task(watch())
 
 
 @app.middleware("http")
@@ -970,13 +1045,75 @@ def _pack_key(extra: tuple = ()) -> tuple:
             _mt("applications.json"), _mt("outreach_log.json"), _mt("contacts", True), *extra)
 
 
+_BYTES_MEMO: dict = {}
+
+
+def _warm_jobs() -> None:
+    """Build the packed list and its gzipped bytes at startup, so the first page load is a memory read."""
+    r = _cached_jobs_full(True)
+    for rej in (False, True):
+        data = r if rej else {**r, "jobs": [j for j in r.get("jobs", []) if j.get("status") != "reject"]}
+        raw = json.dumps(data, separators=(",", ":"), default=str).encode("utf-8")
+        _BYTES_MEMO[rej] = (r, raw, gzip.compress(raw, 5))
+
+
 @app.get("/api/jobs")
-def cached_jobs(slim: bool = False) -> dict:
+def cached_jobs(request: Request, slim: bool = False, rejected: bool = True):
+    """`rejected=false`: same payload without the filtered-out jobs (the new UI loads those on demand).
+    The slim list is encoded + gzipped ONCE per change and served from memory (serialising 12 MB of JSON per request took ~2.5 s)."""
+    result = _cached_jobs_full(slim)
+    if not slim:
+        return result if rejected else {**result, "jobs": [j for j in result.get("jobs", []) if j.get("status") != "reject"]}
+    hit = _BYTES_MEMO.get(rejected)
+    if hit is None or hit[0] is not result:
+        data = result if rejected else {**result, "jobs": [j for j in result.get("jobs", []) if j.get("status") != "reject"]}
+        raw = json.dumps(data, separators=(",", ":"), default=str).encode("utf-8")
+        hit = _BYTES_MEMO[rejected] = (result, raw, gzip.compress(raw, 5))
+    wants_gzip = "gzip" in request.headers.get("accept-encoding", "")
+    return Response(hit[2] if wants_gzip else hit[1], media_type="application/json",
+                    headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"} if wants_gzip else {"Vary": "Accept-Encoding"})
+
+
+_REBUILDING: set = set()
+_BUILT_AT: dict = {}
+
+
+def _warm_bytes(result: dict, slim: bool) -> None:
+    """Encode + gzip the slim payloads once, so a request is a memory read."""
+    if not slim:
+        return
+    for rej in (False, True):
+        data = result if rej else {**result, "jobs": [j for j in result.get("jobs", []) if j.get("status") != "reject"]}
+        raw = json.dumps(data, separators=(",", ":"), default=str).encode("utf-8")
+        _BYTES_MEMO[rej] = (result, raw, gzip.compress(raw, 5))
+
+
+def _cached_jobs_full(slim: bool = False) -> dict:
     live_poller.ensure_running(_start_checker, _start_fetch)
     key = _pack_key((slim,))
     hit = _PACK_MEMO.get(key)
     if hit is not None:
         return hit
+    # Stale-while-revalidate: the list is rebuilt (10-30 s with 24k jobs) whenever any verdict / mark is written, which is every few
+    # seconds while the app works. Serve the last copy at once and rebuild in the background (Nov 19: the page waited 10-30 s per load).
+    ukey = (key[0], slim)
+    stale = next((v for k, v in _PACK_MEMO.items() if k[0] == key[0] and k[-1] == slim), None)
+    if stale is not None and time.time() - _BUILT_AT.get(ukey, 0) < 600:
+        if ukey not in _REBUILDING:
+            _REBUILDING.add(ukey)
+
+            def _bg() -> None:
+                try:
+                    _build_jobs(key, slim)
+                finally:
+                    _REBUILDING.discard(ukey)
+
+            users.thread(_bg)
+        return stale
+    return _build_jobs(key, slim)
+
+
+def _build_jobs(key: tuple, slim: bool) -> dict:
     payload = load_cache()
     # Unchecked jobs (new, or left over when Groq's daily limit ran out) start the checker; after a
     # quota error it waits 30 minutes before trying again.
@@ -987,6 +1124,8 @@ def cached_jobs(slim: bool = False) -> dict:
     for k in [k for k in _PACK_MEMO if k[0] == key[0] and k[-1] == slim]:
         del _PACK_MEMO[k]  # keep only the newest result per user and kind
     _PACK_MEMO[key] = result
+    _BUILT_AT[(key[0], slim)] = time.time()
+    _warm_bytes(result, slim)
     return result
 
 
@@ -1344,7 +1483,7 @@ def autoapply_tag_status() -> dict:
 def autoapply_preview() -> dict:
     from fresherpilot.apply import autoapply
 
-    return autoapply.preview()
+    return autoapply.preview_cached()
 
 
 @app.get("/api/autoapply")
@@ -1352,6 +1491,104 @@ def autoapply_status() -> dict:
     from fresherpilot.apply import autoapply
 
     return autoapply.status()
+
+
+_REASONS = {
+    "closed_posting": "The job is closed or removed", "already_applied": "Already applied", "limit_reached": "Daily limit reached on the board",
+    "captcha": "A bot check needs you", "otp_needed": "A verification code is needed", "auth_required": "Sign-in / account needed",
+    "needs_human": "A question or file only you can answer", "validation_loop": "The form kept rejecting the answers",
+    "too_many_steps": "The form was longer than expected", "stuck_timeout": "The page got stuck", "page_error": "The page or tab crashed",
+    "button_not_found": "No Next / Submit button found", "wrong_page": "Landed on the wrong page", "not_eligible": "Not eligible (location / rules)",
+    "user_skipped": "You skipped it", "handed_off": "Handed to the company-site runner", "other": "Needs a look",
+}
+
+
+def _failure_rows(limit: int = 40) -> list[dict]:
+    d = users.path("failures")
+    rows: list[dict] = []
+    try:
+        dirs = sorted([p for p in Path(d).iterdir() if p.is_dir()], reverse=True)[:limit]
+    except OSError:
+        return rows
+    for p in dirs:
+        try:
+            m = json.loads((p / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        m["reason"] = _REASONS.get(m.get("code"), m.get("detail", "")[:80])
+        m["id"] = p.name
+        m["has_shot"] = (p / "page.png").exists()
+        rows.append(m)
+    return rows
+
+
+@app.get("/api/today")
+def today() -> dict:
+    """One call for the Today screen: what needs the owner, what is running, what failed (with reasons), health."""
+    from fresherpilot.apply import autoapply, failures
+
+    st = autoapply.status()
+    site = st.get("site") or {}
+    rows = _failure_rows()
+    needs = [{"uid": p.get("uid"), "title": p.get("title"), "company": p.get("company"), "why": p.get("reason") or p.get("why") or "Waiting for you",
+              "kind": "board"} for p in (st.get("parked") or [])]
+    seen_uid = {n["uid"] for n in needs}
+    for r in rows:
+        if r.get("status") in ("needs_you", "blocked") and r.get("uid") not in seen_uid and r.get("code") not in failures.TERMINAL:
+            needs.append({"uid": r.get("uid"), "title": (r.get("uid") or "").split(":")[-1][:60], "company": "", "why": r["reason"], "detail": r.get("detail", "")[:160],
+                          "kind": "site", "url": r.get("url")})
+            seen_uid.add(r.get("uid"))
+    failed = [r for r in rows if r.get("status") not in ("needs_you", "blocked") and r.get("code") not in failures.TERMINAL][:15]
+    ext_s = st.get("ext_seen_s")
+    return {
+        "needs_you": needs,
+        "running": {"board": st.get("current"), "board_on": bool(st.get("running")), "site": site.get("current"), "site_queue": site.get("queued", 0)},
+        "failed": failed,
+        "health": {"extension_silent_s": ext_s, "extension_ok": ext_s is None or ext_s < 600, "autoapply_running": bool(st.get("running"))},
+        "counts": {"applied": st.get("applied", 0), "failed": st.get("failed", 0), "site_applied": site.get("applied", 0)},
+    }
+
+
+class RetryRequest(BaseModel):
+    uid: str
+    url: str | None = None
+
+
+@app.post("/api/failures/retry")
+def failure_retry(body: RetryRequest) -> dict:
+    from fresherpilot.apply import site_apply
+
+    url = body.url
+    if not url:
+        url = next((r.get("url") for r in _failure_rows(200) if r.get("uid") == body.uid and r.get("url")), None)
+    if not url:
+        raise HTTPException(status_code=404, detail="no link saved for this job: open it from the Jobs list")
+    res = site_apply.enqueue({"uid": body.uid, "title": body.uid, "company": "retry"}, url, why="retry", manual=True)
+    return {"result": res}
+
+
+class SiteAnswer(BaseModel):
+    uid: str
+    answers: dict[str, str] = {}
+    cmd: str = "continue"
+
+
+@app.post("/api/site/answer")
+def site_answer(body: SiteAnswer) -> dict:
+    """Give a waiting company-site run its answer / code (same file the run polls: site_cmd/<uid>.json)."""
+    d = Path(users.path("site_cmd"))
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / (body.uid.replace(":", "_") + ".json")
+    f.write_text(json.dumps({"answers": body.answers, "cmd": body.cmd}, ensure_ascii=False), encoding="utf-8")
+    return {"ok": True}
+
+
+@app.get("/api/failures/shot")
+def failure_shot(id: str):
+    p = Path(users.path("failures")) / re.sub(r"[^A-Za-z0-9_-]", "", id) / "page.png"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="no screenshot")
+    return FileResponse(p, media_type="image/png")
 
 
 @app.get("/api/extension/version")
@@ -1441,7 +1678,16 @@ def autoapply_take_command(uid: str | None = None, run: str | None = None, accep
 
 @app.get("/api/dashboard")
 def get_dashboard() -> dict:
-    return dashboard.build(_normalized_jobs(load_cache()))
+    key = _pack_key(("dash", datetime.now().astimezone().date().isoformat()))
+    hit = _DASH_MEMO.get("v")
+    if hit and hit[0] == key and time.time() - hit[2] < 120:
+        return hit[1]
+    result = dashboard.build(_cached_jobs_full(True).get("jobs") or [])
+    _DASH_MEMO["v"] = (key, result, time.time())
+    return result
+
+
+_DASH_MEMO: dict = {}
 
 
 @app.get("/api/outreach")
@@ -1630,7 +1876,9 @@ def _autostart() -> None:
         live_poller.ensure_running(_start_checker, _start_fetch)
         _start_checker()
         users.thread(_ai_consumer)  # independent AI stage (see _ai_consumer)
-        users.thread(lambda: cached_jobs(True))  # warm the packed job list so the first page load is not a 9 s wait
+        users.thread(_archive_loop)  # old jobs -> users/<id>/archive (cold storage), every 6 h
+        users.thread(lambda: _warm_jobs())  # warm the packed job list so the first page load is not a 9 s wait
+        users.thread(lambda: (time.sleep(25), __import__('fresherpilot.apply.autoapply', fromlist=['x']).preview_cached()))  # and the Auto-apply job list
         from fresherpilot.apply import site_apply
 
         if site_apply.start_mailwatch():  # verification codes from your Gmail -> Telegram (+ the apply runner's inbox)

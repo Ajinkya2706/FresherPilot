@@ -182,8 +182,12 @@ const report = (event, uid, detail = "", waiting = null) =>
 const cmdUrl = (uid, accept) => `/api/autoapply/command?run=${encodeURIComponent(RUN_ID || "")}${uid ? `&uid=${encodeURIComponent(uid)}` : ""}${accept ? `&accept=${accept}` : ""}`;  // accept: only take these commands, leave the rest for their own reader
 
 // Pause until the user clicks Continue / Skip / Stop in the app.
-const status = (tabId, text, waiting = false) =>
-  inTab(tabId, (t, w) => window.__jfAgent && window.__jfAgent.showStatus(t, w), [text, waiting]).catch(() => null);
+let lastStep = "";
+const status = (tabId, text, waiting = false) => {
+  const uid = applyingTab[tabId];   // the same line goes to the app's Auto-apply page (live step feed)
+  if (uid && text && lastStep !== uid + text) { lastStep = uid + text; report("step", uid, String(text).replace(/…$/, "")); }
+  return inTab(tabId, (t, w) => window.__jfAgent && window.__jfAgent.showStatus(t, w), [text, waiting]).catch(() => null);
+};
 
 // Read the page; if it navigated or reloaded in between (helpers gone), re-inject and retry.
 async function takeSnapshot(tabId) {

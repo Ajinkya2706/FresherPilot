@@ -850,6 +850,9 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
 
     # Merge: this fetch first (fresher data wins, original first-seen date kept), then earlier jobs
     # still within KEEP_JOBS_DAYS.
+    from fresherpilot.jobs import archive as _archive
+
+    archived_ids = _archive.seen_ids()
     previous = old.get("jobs") or []
     prev_by_key = {_dedupe_key(j): j for j in previous}
     jobs: list[dict[str, Any]] = []
@@ -869,6 +872,9 @@ def fetch_latest_jobs(progress: Callable[[int, int, list[str]], None] | None = N
                 continue
             if not in_wanted_location(job):  # before the AI check: no Groq tokens spent on it
                 r["other_city"] += 1
+                continue
+            if f"{job.get('source')}:{job.get('id')}" in archived_ids:  # seen before, now in cold storage
+                r["already_had"] += 1
                 continue
             if name == "google" and (job.get("posted_days") or 0) > max(1, windows[name] / 24 + 1):
                 r.setdefault("too_old", 0)
@@ -972,12 +978,18 @@ def merge_external(items: list[dict[str, Any]], kind: str, check_location: bool 
         for j in jobs:
             by_base.setdefault(_dedupe_base(j), []).append(j)
         added = dupes = other_city = 0
+        from fresherpilot.jobs import archive
+
+        archived = archive.seen_ids()
         for item in items:
             job = normalize(item)
             if not job:
                 continue
             if check_location and not in_wanted_location(job):
                 other_city += 1
+                continue
+            if f"{job.get('source')}:{job.get('id')}" in archived:  # already seen, now in cold storage
+                dupes += 1
                 continue
             same = by_base.setdefault(_dedupe_base(job), [])
             if any(_same_post(job, other) for other in same):

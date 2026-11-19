@@ -214,7 +214,20 @@ def eligible_jobs(include_with_instructions: bool = False, force: set[str] | Non
     blocked = {c.lower() for c in prefs["blocked"]}
     out = []
     # only = the uids asked for (one job by link): clean just those, not all ~27k jobs (that was 15 s of the start)
-    for job in (_jobs_by_uids(only) if only else _normalized_jobs(load_cache())):
+    jobs_in = _jobs_by_uids(only) if only else _normalized_jobs(load_cache())
+    # A job applied under another board / id (Telegram "Applied", a repost) must not be offered again: match by fingerprint
+    applied_keys: set[str] = set()
+    if not only and not force:
+        from fresherpilot.jobs import visited as _vis
+
+        applied_uids = {u for u, e in apps.items() if isinstance(e, dict) and e.get("status") == "applied" and u not in email_only}
+        for e in apps.values():
+            if isinstance(e, dict) and e.get("status") == "applied":
+                applied_keys.update(e.get("keys") or [])
+        for j in jobs_in:
+            if f"{j.get('source')}:{j.get('id')}" in applied_uids:
+                applied_keys.update(_vis.keys(j)[2:])
+    for job in jobs_in:
         if not (job.get("url") or "").startswith("http"):
             continue
         uid = f"{job.get('source')}:{job.get('id')}"
@@ -223,6 +236,11 @@ def eligible_jobs(include_with_instructions: bool = False, force: set[str] | Non
             continue
         if verdict.get("apply_instructions") and not include_with_instructions:
             continue
+        if applied_keys and uid not in apps:
+            from fresherpilot.jobs import visited as _vis
+
+            if applied_keys & set(_vis.keys(job)[2:]):
+                continue  # same job already applied (other board / repost)
         job["uid"] = uid
         job["employer"] = contacts.resolve_company(job)
         if blocked and (_company(job).lower() in blocked or str(job.get("company") or "").strip().lower() in blocked):
@@ -435,20 +453,45 @@ def handoff_to_site(job: dict[str, Any], landed_url: str) -> str:
     new = route.reclassify_after_landing(job, landed_url)
     if not uid or not new or _FORM.search(landed_url or ""):   # Google / MS forms are filled by the extension (applyWithForms)
         return ""
-    if site_apply.enqueue(job, landed_url, why="landed off the board") != "queued":
-        return ""
-    return new["ats"] or "company site"
+    res = site_apply.enqueue(job, landed_url, why="landed off the board", manual=STATE.get("mode") == "single")
+    if res in ("capped", "exists"):  # refused: say so (the extension must NOT carry on and try the portal itself)
+        return "!" + res
+    return (new["ats"] or "company site") if res == "queued" else ""
 
 
 def _site_target(job: dict[str, Any]) -> str:
-    """The company-site link of a job whose own link already is one (Careers pages, Telegram posts with a resolved
-    link, Indeed copies of a company-site job), "" otherwise: those go straight to the local Playwright runner."""
+    """The company-site link of a job that is applied for on a company / ATS page (Workday, Greenhouse...), "" otherwise.
+    Those go to the local Playwright runner, never to the extension's board playbooks (which only know LinkedIn, Naukri...)."""
     from fresherpilot.apply import route
 
-    c = route.classify(job)
-    if c["cls"] != "site" or c["signal"] not in ("url_host", "blog_url_host"):
-        return ""
-    return str(job.get("blog_url") if c["signal"] == "blog_url_host" else job.get("url") or "")
+    return route.site_url(job)
+
+
+_PREVIEW_MEMO: dict[str, Any] = {"at": 0.0, "key": None, "val": None}
+
+
+def _preview_key() -> tuple:
+    """Changes when a job file, an application or a choice changes: the page list is then rebuilt (otherwise reused for a minute)."""
+    from fresherpilot.core import users
+
+    out = []
+    for name in ("jobs_cache.json", "applications.json", "autoapply_prefs.json", "llm_verdicts.json", "visited.json"):
+        try:
+            out.append(users.path(name).stat().st_mtime_ns // 1_000_000_000)
+        except OSError:
+            out.append(0)
+    return (str(users.user_dir()), tuple(out), STATE.get("running"))
+
+
+def preview_cached() -> dict[str, Any]:
+    """preview() took 8-16 s (it cleans every job): reuse the last result while nothing it depends on changed (max 60 s)."""
+    key = _preview_key()
+    m = _PREVIEW_MEMO
+    if m["val"] is not None and m["key"] == key and time.time() - m["at"] < 60:
+        return m["val"]
+    val = preview()
+    m.update(at=time.time(), key=key, val=val)
+    return val
 
 
 def preview() -> dict[str, Any]:
@@ -529,11 +572,14 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
     for j in jobs:
         # Pipeline B: a job whose own link is a company / ATS page goes straight to the local Playwright runner (not
         # when you picked this one job by hand, or when its post has special instructions: email / forms)
-        target = "" if single else _site_target(j)
+        target = _site_target(j)  # also for a job picked by hand: a company portal is never an "easy apply"
         if target and not (j.get("apply_instructions") and (_instruction_plan(j)["emails"] or _instruction_plan(j)["forms"] or _instruction_plan(j)["manual"])):
             from fresherpilot.apply import site_apply
 
-            if site_apply.enqueue(j, target, why="company-site link") == "queued":
+            res = site_apply.enqueue(j, target, why="company-site link", manual=single)
+            if res in ("capped", "exists"):
+                _log("skipped", j, "company-site job not queued: " + ("daily limit of 25 reached (pick it by hand to run anyway)" if res == "capped" else "already queued in the last 24 h"))
+            if res == "queued":
                 site_jobs += 1
             continue
         item = {"uid": j["uid"], "url": j["url"], "title": j["title"], "company": j.get("employer") or j.get("company"),
@@ -568,7 +614,7 @@ def start(uids: list[str] | None, max_jobs: int = 0, sources: list[str] | None =
         users.thread(_send_application_emails, emails, False)  # the browser queue always has these jobs too  # runs as this user (keys, Gmail, profile)
     elif not browser:
         report("finished", None)
-    payload = {"queue": browser, "settings": SETTINGS, "mode": STATE["mode"], "run_id": STATE["run_id"]}
+    payload = {"queue": browser, "settings": SETTINGS, "mode": STATE["mode"], "run_id": STATE["run_id"], "site_jobs": site_jobs}
     with _lock:
         STATE["pending"], STATE["started_at"] = payload, time.time()
     return payload
@@ -600,6 +646,11 @@ def report(event: str, uid: str | None, detail: str = "", waiting: dict[str, Any
                 STATE["pending"] = None  # the extension has it (handed over by the page or pulled)
         if stale:
             return {"stale": True}
+    if event == "step":   # a live progress line from the extension: shown on the Auto-apply page, never written to the results log
+        with _lock:
+            STATE.setdefault("steps", []).append({"at": datetime.now(timezone.utc).isoformat(), "uid": uid, "who": "browser", "text": detail[:140]})
+            STATE["steps"] = STATE["steps"][-60:]
+        return {"ok": True}
     job = next((q for q in STATE["queue"] if q["uid"] == uid), None) if uid else None
     with _lock:
         repeat = event in ("applied", "skipped", "failed") and bool(uid) and uid in STATE["final"]
@@ -667,6 +718,20 @@ def command(action: str, uid: str | None = None) -> None:
             report("skipped", uid, "skipped by you")
         with _lock:  # after the report (which clears old commands): the extension reads it and tidies up the tab
             STATE["job_commands"][uid] = action
+        return
+    if action == "stop":   # a hard stop, at once, in the app: do not wait for the browser to notice
+        try:
+            from fresherpilot.apply import site_apply
+
+            site_apply.stop_all()
+        except Exception:  # noqa: BLE001
+            pass
+        with _lock:
+            was = STATE["running"]
+            STATE.update(running=False, current=None, waiting=None, command=None, commands=[], paused=False, current_at=None,
+                         run_id=None, parked={}, job_commands={}, pending=None, queue=[], index=0)
+        if was:
+            _log("finished", None, "stopped by you")
         return
     with _lock:
         STATE["commands"] = [c for c in STATE["commands"] if c != action]  # a click twice = once
@@ -916,6 +981,22 @@ def decide(body: dict[str, Any]) -> dict[str, Any]:
     """Next action for the extension, from a page snapshot. Every step is written to autoapply_steps.jsonl."""
     began = time.time()
     out = _decide(body)
+    try:   # live step feed for the Auto-apply page: what the robot is doing right now, in plain words
+        job = body.get("job") or {}
+        snap0 = body.get("snapshot") or {}
+        item = next((i for i in (snap0.get("items") or []) if i.get("key") == out.get("key")), None)
+        label = ((item or {}).get("text") or (item or {}).get("label") or "").strip()[:40]
+        act = out.get("action")
+        text = {"fill": "Filling the form", "done": "Application submitted",
+                "click": f"Pressing '{label}'" if label else "Moving to the next step",
+                "skip": "Skipped: " + (out.get("reason") or "")[:100],
+                "needs_user": "Needs you: " + (out.get("reason") or "")[:100]}.get(act, str(act))
+        with _lock:
+            STATE.setdefault("steps", []).append({"at": datetime.now(timezone.utc).isoformat(), "uid": job.get("uid"), "who": "browser", "text": text,
+                                                  "page": (snap0.get("url") or "")[:80]})
+            STATE["steps"] = STATE["steps"][-60:]
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from fresherpilot.core import users
 
@@ -965,6 +1046,10 @@ def _decide(body: dict[str, Any]) -> dict[str, Any]:
     # account, codes from Gmail or Telegram); nothing to do here.
     if not submitted and not filled and job_src and (body.get("job") or {}).get("uid"):
         ats = handoff_to_site(body["job"], url)
+        if ats == "!capped":
+            return {"action": "skip", "key": "", "reason": "Company-site limit reached for today (25 new/day protects your free AI budget). Pick this job by hand to run it anyway, or raise site_daily_cap in the auto-apply settings"}
+        if ats == "!exists":
+            return {"action": "skip", "key": "", "reason": "Already handed to the Playwright runner in the last 24 h (see the company-site card)"}
         if ats:
             return {"action": "skip", "key": "", "reason": f"handed to the local Playwright runner ({ats}): it fills the form in its own Chrome window"}
 

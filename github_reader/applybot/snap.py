@@ -41,7 +41,14 @@ JS = r"""
   const before = (a, b) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);   // a is before b
   const labelOf = (el) => {
     const out = [];
-    const al = el.getAttribute('aria-label'); if (al && al.replace(/select one|required|\\*/ig, '').trim().length > 2) out.push(al);
+    // Workday: every question sits in its own formField block that holds the question text. A dropdown button's aria-label is only its CURRENT VALUE
+    // + "Required" (" Accenture Required", " 11-15 Required"), never the question (CBA, Nov 19: the AI answered "10-15 years", "Accenture").
+    const ffb = el.closest('[data-automation-id^=formField]');
+    if (ffb && q(CTRL, ffb).length <= 2) {
+      const l = q('label,legend,[data-automation-id*=label i]', ffb).filter((x) => !x.contains(el) && !x.querySelector(CTRL) && own(x))[0];
+      if (l) out.push(own(l));
+    }
+    const al = el.getAttribute('aria-label'); if (!out.some(Boolean) && !el.matches('button[aria-haspopup]') && al && al.replace(/select one|required|\\*/ig, '').trim().length > 2) out.push(al);
     const lb = el.getAttribute('aria-labelledby');
     if (lb) lb.split(/\s+/).forEach((i) => { const x = document.getElementById(i); if (x) out.push(own(x)); });
     if (el.id) q('label[for="' + CSS.escape(el.id) + '"]').forEach((l) => out.push(own(l)));
@@ -130,8 +137,10 @@ JS = r"""
     const tag = el.tagName.toLowerCase(), type = (el.getAttribute('type') || '').toLowerCase();
     if (tag === 'input' && ['hidden', 'submit', 'button', 'image', 'reset'].includes(type)) return;   // (a <button type=button aria-haspopup=listbox> is a dropdown: kept)
     const isFile = type === 'file';
+    const wdDate = el.getAttribute('data-automation-id') === 'dateSectionMonth-input';   // Workday date: invisible spin buttons (Month / Day / Year) under a drawn "MM / YYYY" label
+    if (el.getAttribute('data-automation-id') === 'dateSectionYear-input' || el.getAttribute('data-automation-id') === 'dateSectionDay-input') return;   // one field per date: the Month box stands for it
     const wd = el.getAttribute('data-automation-id') === 'searchBox' || /selectinput|multiselect/.test(el.getAttribute('data-uxi-widget-type') || '');
-    if (!isFile && !wd && !vis(el) && !(type === 'radio' || type === 'checkbox')) return;
+    if (!isFile && !wd && !wdDate && !vis(el) && !(type === 'radio' || type === 'checkbox')) return;
     if (isFile ? false : (type === 'radio' || type === 'checkbox') && !vis(el) && !(el.labels && el.labels[0] && vis(el.labels[0])) && !vis(el.parentElement)) return;
     let kind = 'text';
     if (tag === 'textarea') kind = 'textarea';
@@ -140,12 +149,21 @@ JS = r"""
     else if (type === 'radio' || el.getAttribute('role') === 'radio') kind = 'radio';
     else if (type === 'checkbox' || el.getAttribute('role') === 'checkbox') kind = 'checkbox';
     else if (isFile) kind = 'file';
+    else if (wdDate) kind = 'date';
     else if (wd || (tag === 'input' && (el.getAttribute('placeholder') || '') === 'Search' && el.getAttribute('autocomplete') === 'off' && el.getAttribute('aria-required') !== null)) kind = 'combo';   // Workday: a search box whose pop-up list holds the options
     else if (['password', 'email', 'tel', 'number', 'date'].includes(type)) kind = type;
     else if (el.getAttribute('contenteditable') === 'true') kind = 'textarea';
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
     let label = kind === 'radio' ? groupLabel(el) : labelOf(el);
     if (/^(month|day|year|mm|dd|yyyy|hour|minute)$/i.test((label || '').trim())) { const g = groupLabel(el); if (g && g.toLowerCase() !== label.trim().toLowerCase()) label = g + ' ' + label.trim(); }   // Taleo: two selects named Month / Year under a legend "Start Date"
+    if (wdDate) {   // label = the group's name ("From", "To", "Start Date"); the display text under it shows what is filled
+      const ff = el.closest('[data-automation-id^=formField]'); const fl = ff && ff.querySelector('label,legend');
+      const m = (el.id || '').match(/(start|end|from|to|graduation|issue|expir)\w*date/i) || (el.id || '').match(/(start|end)/i);
+      const g = (fl && txt(fl)) || groupLabel(el) || (m ? (/^(start|from)/i.test(m[1]) ? 'From (start date)' : /^(end|to)/i.test(m[1]) ? 'To (end date)' : m[1] + ' date') : '');
+      if (g && !/^(month|year|day)$/i.test(g.trim())) label = g;
+      const yr = el.closest('[data-automation-id*=dateInputWrapper],[data-automation-id*=formField]');
+      el.__wdvalue = yr ? [...yr.querySelectorAll('input[role=spinbutton]')].map((i) => i.value || '').join('/').replace(/^\/+|\/+$/g, '') : '';
+    }
     const f = { frame: frameNo, kind, label: label.slice(0, 240), name: el.getAttribute('name') || el.id || '', placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
                 autocomplete: ac, maxlength: el.maxLength > 0 ? el.maxLength : 0, required: !!(el.required || el.getAttribute('aria-required') === 'true' || needsStar(label)),
                 invalid: el.getAttribute('aria-invalid') === 'true' || (el.validity && !el.validity.valid && el.value !== ''), error: errOf(el),
@@ -187,8 +205,11 @@ JS = r"""
         }
         f.heading = head;
       }
-      else f.value = el.value !== undefined ? el.value : txt(el);
+      else f.value = wdDate ? (el.__wdvalue || '') : (el.value !== undefined ? el.value : txt(el));
+      if (wdDate) { f.htype = 'wd-date'; f.placeholder = 'MM/YYYY'; f.hint = 'type month and year, e.g. 08/2026'; }
     }
+    const ffb = el.closest('[data-automation-id^=formField]');   // Workday: every dropdown is a "searchBox"; the owning formField-* block tells them apart
+    if (ffb) f.block = ffb.getAttribute('data-automation-id') + '#' + (ffb.id || '');
     fields.push(f);
   });
   fields.forEach((f) => delete f._key);

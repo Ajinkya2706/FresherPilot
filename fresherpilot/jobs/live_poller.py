@@ -258,6 +258,10 @@ def _known(s: dict[str, Any], source: str) -> set[str]:
         by: dict[str, set[str]] = {}
         for j in (apify_jobs.load_cache() or {}).get("jobs") or []:
             by.setdefault(str(j.get("source")), set()).add(str(j.get("id")))
+        from fresherpilot.jobs import archive
+
+        for src, ids in archive.archived_by_source().items():  # archived jobs still count as known
+            by.setdefault(src, set()).update(ids)
         s["known"], s["known_at"] = by, time.time()
     return s["known"].setdefault(source, set())
 
