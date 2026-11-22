@@ -9,4 +9,4 @@ crons = ["* * * * *"]   # every minute: one source step + one AI step
 [[d1_databases]]
 binding = "DB"
 database_name = "fresherpilot"
-database_id = "c98408d0-58a1-4ad4-9af1-c54a83842607"
+database_id = "6c61a21d-597d-4f36-8bd5-752fb0d9b943"
